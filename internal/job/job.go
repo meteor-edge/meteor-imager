@@ -37,7 +37,9 @@ type Request struct {
 type Event struct {
 	Stage    string  `json:"stage"`
 	Fraction float64 `json:"fraction"`
-	Message  string  `json:"message,omitempty"`
+	// Bytes written (write) or read back (verify) so far.
+	Bytes   int64  `json:"bytes,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // Stages, in order.
@@ -115,7 +117,7 @@ func Run(ctx context.Context, req Request, emit func(Event)) (*flash.Report, err
 	rep, err := flash.Write(ctx, src, tgt, req.Device.SizeBytes, req.Profile, flash.Options{
 		SkipVerify: req.SkipVerify,
 		SyncEvery:  flash.DeviceSyncEvery,
-		Progress:   func(s flash.Stage, f float64) { emit(Event{Stage: string(s), Fraction: f}) },
+		Progress:   func(s flash.Stage, f float64, n int64) { emit(Event{Stage: string(s), Fraction: f, Bytes: n}) },
 	})
 	if cerr := tgt.Close(); err == nil && cerr != nil {
 		err = fmt.Errorf("close %s: %w", req.Device.Path, cerr)

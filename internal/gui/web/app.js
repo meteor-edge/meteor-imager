@@ -271,7 +271,9 @@ async function poll() {
   const pct = Math.round((st.fraction || 0) * 100);
   $("bar-fill").style.width = `${st.stage === "done" ? 100 : pct}%`;
   const label = (STAGES.find(([k]) => k === st.stage) || [null, ""])[1];
-  $("progress-label").textContent = st.running ? `${label} ${pct}%` : "";
+  const amount = st.bytes && (st.stage === "write" || st.stage === "verify")
+    ? ` · ${fmtSize(st.bytes)} ${st.stage === "write" ? "written" : "checked"}` : "";
+  $("progress-label").textContent = st.running ? `${label} ${pct}%${amount}` : "";
   $("messages").replaceChildren(...(st.messages || []).map((m) => el("li", {}, m)));
 
   if (st.running) { setTimeout(poll, 500); return; }

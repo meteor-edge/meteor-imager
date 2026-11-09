@@ -130,7 +130,7 @@ func TestWriteVerifyConfigure(t *testing.T) {
 	card := &memDisk{data: make([]byte, 128<<20)}
 	var stages []Stage
 	rep, err := Write(context.Background(), src, card, int64(len(card.data)), testProfile(), Options{
-		Progress: func(s Stage, f float64) {
+		Progress: func(s Stage, f float64, _ int64) {
 			if len(stages) == 0 || stages[len(stages)-1] != s {
 				stages = append(stages, s)
 			}

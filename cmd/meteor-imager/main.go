@@ -464,7 +464,7 @@ func runConfigure(ctx context.Context, args []string) error {
 	}
 	b := newBar("write")
 	rep, err := flash.ConfigureFile(ctx, path, *out, p, flash.Options{
-		Progress: func(s flash.Stage, f float64) {
+		Progress: func(s flash.Stage, f float64, _ int64) {
 			if s == flash.StageWrite {
 				b.set(f)
 			}

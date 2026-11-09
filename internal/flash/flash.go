@@ -41,8 +41,9 @@ const (
 	StageFinish    Stage = "finish"
 )
 
-// Progress reports progress within a stage, from 0 to 1.
-type Progress func(stage Stage, fraction float64)
+// Progress reports progress within a stage: fraction from 0 to 1, and bytes
+// written (write) or read back (verify) so far.
+type Progress func(stage Stage, fraction float64, bytes int64)
 
 // Options control a flash run.
 type Options struct {
@@ -79,7 +80,7 @@ var ErrTooSmall = errors.New("the image is larger than the card")
 func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int64, p *profile.FlashProfile, opt Options) (*Report, error) {
 	progress := opt.Progress
 	if progress == nil {
-		progress = func(Stage, float64) {}
+		progress = func(Stage, float64, int64) {}
 	}
 	if capacity > 0 && src.ImageSize > capacity {
 		return nil, fmt.Errorf("%w (%s image, %s card)", ErrTooSmall, human(src.ImageSize), human(capacity))
@@ -125,7 +126,7 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 				}
 				unsynced = 0
 			}
-			progress(StageWrite, src.Progress())
+			progress(StageWrite, writeFraction(src, off), off)
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
@@ -141,7 +142,7 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 	if err := tgt.Sync(); err != nil {
 		return nil, fmt.Errorf("flush: %w", err)
 	}
-	progress(StageWrite, 1)
+	progress(StageWrite, 1, total)
 	rep := &Report{BytesWritten: total}
 
 	// 2. Read the body back and compare hashes.
@@ -159,7 +160,7 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 			}
 			vh.Write(rb[:n])
 			pos += int64(n)
-			progress(StageVerify, float64(pos)/float64(total))
+			progress(StageVerify, float64(pos)/float64(total), pos)
 		}
 		if !bytes.Equal(vh.Sum(nil), h.Sum(nil)) {
 			return nil, errors.New("verification failed: the card returned different data than was written; it may be faulty or counterfeit")
@@ -170,7 +171,7 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 	// 3. Boot partition edits, through the held-back head.
 	ov := &overlay{head: head, tgt: tgt, writes: map[int64][]byte{}}
 	if p != nil {
-		progress(StageConfigure, 0)
+		progress(StageConfigure, 0, 0)
 		vol, err := bootfs.OpenBoot(ov)
 		if err != nil {
 			return nil, err
@@ -183,11 +184,11 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 			return nil, err
 		}
 		rep.Boot = res
-		progress(StageConfigure, 1)
+		progress(StageConfigure, 1, 0)
 	}
 
 	// 4. Partition table last, then confirm everything since step 2 landed.
-	progress(StageFinish, 0)
+	progress(StageFinish, 0, 0)
 	if _, err := tgt.WriteAt(head, 0); err != nil {
 		return nil, fmt.Errorf("write partition table: %w", err)
 	}
@@ -198,7 +199,7 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 	if err := ov.checkWrites(); err != nil {
 		return nil, err
 	}
-	progress(StageFinish, 1)
+	progress(StageFinish, 1, 0)
 	return rep, nil
 }
 
@@ -254,6 +255,17 @@ func (o *overlay) checkWrites() error {
 		}
 	}
 	return nil
+}
+
+// writeFraction uses the image size when known (raw, zip). For xz and gzip it
+// falls back to how much of the compressed file was read, capped below 1:
+// zeros at the end of an image compress to almost nothing, so the compressed
+// file can be fully read while gigabytes are still to be written.
+func writeFraction(src *diskimage.Source, written int64) float64 {
+	if src.ImageSize > 0 {
+		return min(float64(written)/float64(src.ImageSize), 1)
+	}
+	return min(src.Progress(), 0.99)
 }
 
 func human(n int64) string { return fmt.Sprintf("%.1f GB", float64(n)/1e9) }

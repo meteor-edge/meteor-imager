@@ -100,6 +100,7 @@ type jobState struct {
 	Running  bool          `json:"running"`
 	Stage    string        `json:"stage,omitempty"`
 	Fraction float64       `json:"fraction"`
+	Bytes    int64         `json:"bytes,omitempty"`
 	Messages []string      `json:"messages,omitempty"`
 	Error    string        `json:"error,omitempty"`
 	Problems []string      `json:"problems,omitempty"`
@@ -399,7 +400,7 @@ func (s *server) handleFlash(w http.ResponseWriter, r *http.Request) {
 			AllowNonRemovable: req.AllowNonRemovable, SkipVerify: req.SkipVerify,
 		}, func(e job.Event) {
 			s.mu.Lock()
-			s.state.Stage, s.state.Fraction = e.Stage, e.Fraction
+			s.state.Stage, s.state.Fraction, s.state.Bytes = e.Stage, e.Fraction, e.Bytes
 			if e.Message != "" && e.Stage != job.StageOpen {
 				s.state.Messages = append(s.state.Messages, e.Message)
 			}
