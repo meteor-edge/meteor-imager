@@ -58,4 +58,4 @@ jobs:
       - name: Cross-compile
         run: make cross VERSION=ci-${{ github.sha }}
       - name: Linux packages
-        run: scripts/package-linux.sh ci amd64
+        run: scripts/package-linux.sh 0.0.0-ci amd64
