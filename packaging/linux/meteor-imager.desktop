@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Meteor Imager
+GenericName=SD card imager
+Comment=Write Raspberry Pi OS cards that enroll in MeteorCloud
+Exec=meteor-imager
+Icon=meteor-imager
+Terminal=false
+Categories=System;Utility;
+Keywords=raspberry;pi;sd;card;flash;imager;meteorcloud;

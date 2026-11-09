@@ -1,0 +1,134 @@
+# fat
+[![go.dev reference](https://pkg.go.dev/badge/github.com/soypat/fat)](https://pkg.go.dev/github.com/soypat/fat)
+[![Go Report Card](https://goreportcard.com/badge/github.com/soypat/fat)](https://goreportcard.com/report/github.com/soypat/fat)
+[![codecov](https://codecov.io/gh/soypat/fat/branch/main/graph/badge.svg)](https://codecov.io/gh/soypat/fat)
+[![Go](https://github.com/soypat/fat/actions/workflows/go.yml/badge.svg)](https://github.com/soypat/fat/actions/workflows/go.yml)
+[![sourcegraph](https://sourcegraph.com/github.com/soypat/fat/-/badge.svg)](https://sourcegraph.com/github.com/soypat/fat?badge)
+[![License: BSD-3Clause](https://img.shields.io/badge/License-BSD-3.svg)](https://opensource.org/licenses/bsd-3-clause)
+
+A File Allocation Table implementation written in Go. Intended for use in embedded systems 
+with SD cards, USBs, MMC devices and also usable with an in-RAM representation. Inspired by [FatFs](https://github.com/abbrev/fatfs).
+
+This is a *Work in Progress*.
+
+How to install package with newer versions of Go (+1.16):
+```sh
+go mod download github.com/soypat/fat@latest
+```
+
+### Basic usage example
+
+The following example does the following:
+1. Mounts a FAT filesystem to the `fat.FS` type.
+2. Creates a new empty file called `newfile.txt`, replacing any existing file.
+3. Writes `Hello, World!` to that file.
+4. Closes the file to synchronize pending changes to the FAT filesystem.
+5. Opens the file in read mode and reads all of it's contents and prints them to standard output.
+
+```go
+package main
+
+import "github.com/soypat/fat"
+
+func main() {
+	// device could be an SD card, RAM, or anything that implements the BlockDevice interface.
+	device := NewFATDevice()
+	var fs fat.FS
+	err := fs.Mount(device, device.BlockSize(), fat.ModeRW)
+	if err != nil {
+		panic(err)
+	}
+	var file fat.File
+	err = fs.OpenFile(&file, "newfile.txt", fat.ModeCreateAlways|fat.ModeWrite)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = file.Write([]byte("Hello, World!"))
+	if err != nil {
+		panic(err)
+	}
+	err = file.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	// Read back the file:
+	err = fs.OpenFile(&file, "newfile.txt", fat.ModeRead)
+	if err != nil {
+		panic(err)
+	}
+	data, err := io.ReadAll(&file)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(data))
+	file.Close()
+    // Output: Hello, World!
+}
+```
+## exFAT support
+
+exFAT volumes are fully supported: mount, read, write, create, delete,
+rename, directories, files larger than 4GiB (sizes are 64-bit throughout the
+API) and formatting via `Formatter.Format` with `FormatExFAT`. The
+implementation is a faithful port of FatFs R0.16 with `FF_FS_EXFAT=1` and is
+verified byte-for-byte against C-generated golden images, including `f_mkfs`
+output.
+
+Limitations:
+- Only 512-byte sectors are supported (the disk access window is fixed
+  size); exFAT media formatted with larger sector sizes is rejected at mount.
+- Volumes must be addressable in 32-bit LBA (up to 2TiB at 512B sectors).
+- The allocation bitmap must be contiguous (a FatFs implementation
+  assumption; bitmaps produced by standard formatters always are).
+- Like FatFs, a modified exFAT file must be `Sync`ed or `Close`d before
+  `Unmount`: fragmented-chain FAT updates are deferred to file sync, so an
+  unsynced file loses more state than it would on FAT12/16/32.
+
+### Disabling exFAT support
+
+Building with the `fat_noexfat` build tag compiles exFAT support out,
+the equivalent of a FatFs build with `FF_FS_EXFAT=0`:
+
+```sh
+go build -tags fat_noexfat .
+```
+
+exFAT volumes are then rejected at mount with an unsupported error. The
+build drops all exFAT machinery and shrinks `fat.FS` by the 608 byte
+directory entry set scratchpad: measured on a TinyGo `pico` build of a
+mount-and-read program as ~3.0kB less flash and 608B less RAM (the format
+and write paths are already dropped by the linker when unused). `fat_nolfn`
+also disables exFAT, since exFAT requires long file name support.
+
+## Disabling long file name support
+
+Building with the `fat_nolfn` build tag disables long file name (LFN) support,
+the equivalent of a FatFs build with `FF_USE_LFN=0`:
+
+```sh
+go build -tags fat_nolfn .
+```
+
+Only 8.3 short names work in this mode: names longer than 8.3 or otherwise not
+representable as a short name return an invalid name error, and directory
+listings report the stored short name (uppercase). In exchange the build drops
+the LFN machinery — the embedded OEM code page table, UTF-8/UTF-16 name
+conversion and the LFN directory entry handling — measured on a TinyGo
+`pico` build as ~4.4kB less flash and ~4.8kB less RAM (code page table no
+longer copied to RAM, plus the 512 byte LFN working buffer in `fat.FS`).
+
+## Testing
+
+The test suite includes golden torture tests (`golden_torture_test.go`,
+`exfat_test.go`) that replay deterministic operation scripts against
+pre-formatted FAT12, FAT16, FAT32 and exFAT images and require the result to
+match, byte for byte, images generated by the original C FatFs (ff16) driven
+through the identical script. The Go exFAT formatter is likewise required to
+reproduce the C `f_mkfs` output exactly. The golden images live
+gzip-compressed in `testdata/` and are generated by `testdata/mkgolden.c`;
+see its header comment for the exact build and regeneration commands
+(requires `gcc` and the vendored ff16 sources under `local/ff16/source` with
+`FF_USE_MKFS=1`, `FF_USE_LFN=1`, `FF_LFN_UNICODE=2`, `FF_CODE_PAGE=437` and
+`FF_FS_EXFAT=1`).

@@ -1,0 +1,2584 @@
+package fat
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"math/bits"
+	"sync"
+	"time"
+	"unsafe"
+)
+
+// var _ fs.FS = (*FS)(nil)
+
+type BlockDevice interface {
+	ReadBlocks(dst []byte, startBlock int64) (int, error)
+	WriteBlocks(data []byte, startBlock int64) (int, error)
+	EraseBlocks(startBlock, numBlocks int64) error
+	// Mode returns 0 for no connection/prohibited access, 1 for read-only, 3 for read-write.
+	// Mode() accessmode
+}
+
+// sector index type.
+type lba uint32
+
+// FS is the FAT filesystem type. The zero value is unmounted; call Mount
+// before use. FS must not be copied while mounted.
+//
+// FS and its open files and directories are safe for concurrent use:
+// every exported operation takes a single per-filesystem lock, so calls
+// are serialized, never parallel.
+type FS struct {
+	// mu is the coarse per-filesystem lock. File and Dir operations take
+	// it too: files share the FS's disk access window win[] and FAT/FSInfo
+	// state, so there is no finer grain.
+	mu sync.Mutex
+
+	fstype   Format
+	nFATs    uint8
+	wflag    uint8  // b0:dirty
+	fsi_flag uint8  // FSInfo dirty flag. b7:disabled, b0:dirty.
+	nrootdir uint16 // Number of root directory entries.
+
+	// noZeroFill is [Config.NoZeroFilling]. See [FS.Configure].
+	noZeroFill bool
+
+	blk    blkIdxer
+	csize  uint16    // Cluster size in sectors.
+	ssize  uint16    // Sector size in bytes.
+	lfnbuf lfnbuffer // Long file name working buffer. Empty with fat_nolfn build tag.
+
+	dirbuf    dirbuffer // Directory entry block scratchpad for exFAT. Empty with fat_noexfat build tag.
+	device    BlockDevice
+	last_clst uint32 // Last allocated clusters.
+	free_clst uint32 // Number of free clusters.
+
+	// No relative pathing, we can always use a [fs.FS] wrapper.
+
+	n_fatent uint32 // Number of FAT entries (= number of clusters + 2)
+	fsize    uint32 // Number of sectors per FAT.
+
+	volbase  lba // Volume base sector.
+	fatbase  lba // FAT base sector.
+	dirbase  lba // Root directory base sector/cluster.
+	database lba // Data base sector.
+
+	bitbase lba // Allocation bitmap base sector (exFAT only)
+
+	winsect    lba       // Current sector appearing in the win[].
+	win        [512]byte // Disk access window for Directory/FAT/File.
+	ffCodePage int
+	dbcTbl     [10]byte
+	id         uint16 // Filesystem mount ID. Serves to invalidate open files after mount.
+	perm       Mode
+	codepage   []byte // unicode conversion table.
+	exCvt      []byte //  points to _tblCT* corresponding to codepage table.
+	log        *slog.Logger
+}
+
+type objid struct {
+	fs      *FS
+	id      uint16 // Corresponds to FS.id.
+	attr    uint8
+	stat    uint8
+	objsize int64
+	sclust  uint32
+
+	// exFAT only:
+	n_cont, n_frag, c_scl, c_size, c_ofs uint32
+}
+
+type File struct {
+	obj  objid
+	flag uint8
+	err  fileResult // abort flag (error code)
+
+	// fptr is FatFs' file pointer, and it cannot exceed the file size: f_lseek
+	// clips it on a read-only handle and GROWS THE FILE on a writable one, so it
+	// is not a position so much as a cursor into data that exists.
+	//
+	// pos is the position the exported API promises, and it may sit past the end
+	// of the file, where POSIX puts it after a seek past EOF. It is authoritative;
+	// fptr trails it and is brought into line by File.seekTo before anything
+	// touches the disk, or by File.growTo when a write has to make the gap real.
+	// Nothing below this line in the file — none of the ported FatFs — knows pos
+	// exists.
+	fptr     int64
+	pos      int64
+	clust    uint32
+	sect     lba
+	dir_sect lba
+	dir_ptr  []byte
+	cltbl    []uint32  // Pointer to the cluster link map table (Nulled on file open, set by application)
+	buf      [512]byte // Private read/write sector buffer.
+}
+
+type dir struct {
+	obj   objid
+	dptr  uint32   // current read/write offset
+	clust uint32   // current cluster
+	sect  lba      // current sector
+	dir   []byte   // current directory entry in win[]
+	fn    [12]byte // SFN (in/out) {body[8],ext[3],status[1]}
+
+	// Use LFN:
+	blk_ofs uint32 // Offset of current entry block being processed (0:sfn, 1-:lfn)
+}
+
+const (
+	lfnBufSize = 255
+	sfnBufSize = 12
+)
+
+type FileInfo struct {
+	fsize    int64 // File Size.
+	datetime datetime
+	fattrib  byte
+	altname  [sfnBufSize + 1]byte
+	fname    fnamebuffer
+}
+
+type mkfsParam struct {
+	fmt     byte
+	n_fat   uint8
+	align   uint32
+	n_root  uint32
+	au_size uint32 // cluster size in bytes.
+}
+
+type diskstatus uint8
+
+const (
+	diskstatusNoInit diskstatus = 1 << iota
+	diskstatusNoDisk
+	diskstatusWriteProtected
+)
+
+type diskresult int
+
+const (
+	drOK             diskresult = iota // successful
+	drError                            // R/W error
+	drWriteProtected                   // write protected
+	drNotReady                         // not ready
+	drParError                         // invalid parameter
+)
+
+// fileResult is file function return code.
+type fileResult int
+
+const (
+	frOK               fileResult = iota // succeeded
+	frDiskErr                            // a hard error occurred in the low level disk I/O layer
+	frIntErr                             // assertion failed
+	frNotReady                           // the physical drive cannot work
+	frNoFile                             // could not find the file
+	frNoPath                             // could not find the path
+	frInvalidName                        // the path name format is invalid
+	frDenied                             // access denied due to prohibited access or directory full
+	frExist                              // access denied due to prohibited access
+	frInvalidObject                      // the file/directory object is invalid
+	frWriteProtected                     // the physical drive is write protected
+	frInvalidDrive                       // the logical drive number is invalid
+	frNotEnabled                         // the volume has no work area
+	frNoFilesystem                       // there is no valid FAT volume
+	frMkfsAborted                        // the f_mkfs() aborted due to any problem
+	frTimeout                            // could not get a grant to access the volume within defined period
+	frLocked                             // the operation is rejected according to the file sharing policy
+	frNotEnoughCore                      // LFN working buffer could not be allocated
+	frTooManyOpenFiles                   // number of open files > FF_FS_LOCK
+	frInvalidParameter                   // given parameter is invalid
+	frUnsupported                        // the operation is not supported
+	frClosed                             // the file is closed
+	frGeneric                            // fat generic error
+)
+
+func (fr fileResult) Error() string {
+	return fr.String()
+}
+
+// Is maps FAT results onto the standard library sentinels so callers can use
+// errors.Is with fs.ErrNotExist and friends.
+func (fr fileResult) Is(target error) bool {
+	switch target {
+	case fs.ErrNotExist:
+		return fr == frNoFile || fr == frNoPath
+	case fs.ErrExist:
+		return fr == frExist
+	case fs.ErrInvalid:
+		return fr == frInvalidName || fr == frInvalidParameter || fr == frInvalidObject
+	case fs.ErrPermission:
+		return fr == frDenied || fr == frWriteProtected
+	}
+	return false
+}
+
+// bootsectorstatus is the return code for mount_volume.
+//   - 0:FAT/FAT32 VBR
+//   - 1:exFAT VBR
+//   - 2:Not FAT and valid BS
+//   - 3:Not FAT and invalid BS
+//   - 4:Disk error
+type bootsectorstatus uint
+
+const (
+	bootsectorstatusFAT bootsectorstatus = iota
+	bootsectorstatusExFAT
+	bootsectorstatusNotFATValidBS
+	bootsectorstatusNotFATInvalidBS
+	bootsectorstatusDiskError
+)
+
+func (fp *File) f_read(buff []byte) (br int, res fileResult) {
+	fsys := fp.obj.fs
+	fsys.trace("f_read", slog.Int("len", len(buff)))
+	rbuff := buff
+	if fp.flag&faRead == 0 {
+		return 0, frDenied
+	} else if fsys.perm&ModeRead == 0 {
+		return 0, frDenied
+	}
+	remain := fp.obj.objsize - fp.fptr
+	btr := len(buff)
+	if btr > int(remain) {
+		btr = int(remain)
+	}
+	var csect, clst uint32
+	var rcnt int
+	ss := int64(fsys.ssize)
+	cs := int64(fsys.csize)
+
+	for {
+		btr -= rcnt
+		br += rcnt
+		rbuff = rbuff[rcnt:]
+		fp.fptr += int64(rcnt)
+		if btr <= 0 {
+			break
+		}
+		if fp.fptr%ss == 0 {
+			csect = uint32((fp.fptr / ss) & (cs - 1))
+			if csect == 0 {
+				if fp.fptr == 0 {
+					clst = fp.obj.sclust
+				} else {
+					// Follow cluster chain on the FAT.
+					clst = fp.obj.clusterstat(fp.clust)
+				}
+				if clst < 2 {
+					return br, fp.abort(frIntErr)
+				} else if clst == badCluster {
+					return br, fp.abort(frDiskErr)
+				}
+				fp.clust = clst
+			}
+			sect := fsys.clst2sect(fp.clust)
+			if sect == 0 {
+				return br, fp.abort(frIntErr)
+			}
+			sect += lba(csect)
+			cc := btr / int(ss)
+			if cc > 0 {
+				// When remaining bytes >= sector size, read maximum contiguous sectors directly.
+				if csect+uint32(cc) > uint32(cs) {
+					// Clip at cluster boundary.
+					cc = int(cs) - int(csect)
+				}
+				if fsys.disk_read(buff[br:br+cc*int(ss)], sect, cc) != drOK {
+					return br, fp.abort(frDiskErr)
+				}
+				if fp.flag&faDIRTY != 0 && fp.sect-sect < lba(cc) {
+					off := (fp.sect - sect) * lba(ss)
+					copy(rbuff[off:], fp.buf[:])
+				}
+				// Number of bytes transferred.
+				rcnt = int(ss) * cc
+				continue
+			}
+			if fp.flag&faDIRTY != 0 {
+				// Write back dirty cache.
+				if fsys.disk_write(fp.buf[:], fp.sect, 1) != drOK {
+					return br, fp.abort(frDiskErr)
+				}
+				fp.flag &^= faDIRTY
+			}
+			if fsys.disk_read(fp.buf[:], sect, 1) != drOK {
+				return br, fp.abort(frDiskErr)
+			}
+			fp.sect = sect
+		}
+		modfptr := int(fp.fptr % ss)
+		rcnt = int(ss) - modfptr
+		if rcnt > btr {
+			rcnt = btr
+		}
+		copy(rbuff[:rcnt], fp.buf[modfptr:])
+	}
+	return br, frOK
+}
+
+func (fp *File) f_close() fileResult {
+	fsys := fp.obj.fs
+	fsys.trace("f_close")
+	fr := fsys.f_sync(fp)
+	if fr != frOK {
+		return fr
+	} else if fr = fp.obj.validate(); fr != frOK {
+		return fr
+	}
+	// Invalidate the handle by id instead of clearing obj.fs: the exported
+	// lock path reads obj.fs without holding the lock (see (*File).lock),
+	// so obj.fs must never be written on a live handle.
+	fp.obj.id--
+	return frOK
+}
+
+func (obj *objid) validate() fileResult {
+	if obj.fs == nil || obj.id != obj.fs.id {
+		return frInvalidObject
+	}
+	return frOK
+}
+
+func (fsys *FS) isExfat() bool {
+	return exfatEnabled && fsys.fstype == FormatExFAT
+}
+
+func (fsys *FS) f_sync(fp *File) (fr fileResult) {
+	fsys.trace("f_sync")
+	if fp.flag&faMODIFIED == 0 {
+		return frOK // No pending changes to file.
+	}
+	if fp.flag&faDIRTY != 0 {
+		if fsys.disk_write(fp.buf[:], fp.sect, 1) != drOK {
+			return frDiskErr
+		}
+		fp.flag &^= faDIRTY
+	}
+
+	// Update directory entry.
+	tm := fsys.time()
+	if fsys.isExfat() {
+		fr = fsys.f_sync_exfat(fp, tm)
+		if fr == frOK {
+			fp.flag &^= faMODIFIED
+		}
+		return fr
+	}
+	fr = fsys.move_window(fp.dir_sect)
+	if fr != frOK {
+		return fr
+	}
+	dir := fp.dir_ptr
+	dir[dirAttrOff] = amARC // 'file changed' attribute set.
+	fsys.st_clust(dir, fp.obj.sclust)
+	binary.LittleEndian.PutUint32(dir[dirFileSizeOff:], uint32(fp.obj.objsize))
+	binary.LittleEndian.PutUint32(dir[dirModTimeOff:], tm)
+	// meteor-imager patch: LstAccDate is a WORD. Writing a DWORD here zeroed
+	// FstClusHI, truncating start clusters above 65535 on FAT32.
+	binary.LittleEndian.PutUint16(dir[dirLstAccDateOff:], 0)
+	fsys.wflag = 1
+	fr = fsys.sync()
+	fp.flag &^= faMODIFIED
+	return fr
+}
+
+func (fp *File) abort(fr fileResult) fileResult {
+	fp.err = fr
+	return fr
+}
+
+func (fp *File) f_write(buf []byte) (bw int, fr fileResult) {
+	fr = fp.obj.validate()
+	if fr != frOK {
+		return 0, fr
+	} else if fp.err != frOK {
+		return 0, fp.err
+	} else if fp.flag&faWrite == 0 {
+		return 0, frWriteProtected
+	} else if fp.obj.fs.perm&ModeWrite == 0 {
+		return 0, frWriteProtected
+	}
+	fs := fp.obj.fs
+	btw := len(buf)
+	if fs.fstype != FormatExFAT && fp.fptr+int64(btw) < fp.fptr {
+		// Make sure file does not reach over 4GB limit on non exFAT.
+		btw = int(int64(maxu32) - fp.fptr)
+	}
+
+	wbuff := buf
+	var wcnt int
+	var clst uint32
+outerLoop:
+	for btw > 0 {
+		btw -= wcnt
+		bw += wcnt
+		wbuff = wbuff[wcnt:]
+		fp.fptr += int64(wcnt)
+		fp.obj.objsize = max(fp.obj.objsize, fp.fptr)
+		if btw <= 0 {
+			break
+		}
+
+		if fs.modSS(uint32(fp.fptr)) == 0 {
+			// On the sector boundary?
+			csect := uint32(fp.fptr/int64(fs.ssize)) & uint32(fs.csize-1)
+			if csect == 0 {
+				if fp.fptr == 0 {
+					clst = fp.obj.sclust
+					if clst == 0 {
+						// No cluster allocated yet.
+						clst = fp.obj.create_chain(0)
+					}
+				} else {
+					// Middle or end of file.
+					clst = fp.obj.create_chain(fp.clust)
+				}
+				switch clst {
+				case 0:
+					// Could not allocate a new cluster (disk full)
+					break outerLoop
+				case 1:
+					return bw, fp.abort(frIntErr)
+				case badCluster:
+					return bw, fp.abort(frDiskErr)
+				}
+				fp.clust = clst // Update current cluster.
+				if fp.obj.sclust == 0 {
+					// Set cluster if is the first write.
+					fp.obj.sclust = clst
+				}
+			}
+			if fp.flag&faDIRTY != 0 {
+				// Write-back sector cache if needed.
+				if fs.disk_write(fp.buf[:], fp.sect, 1) != drOK {
+					return bw, fp.abort(frDiskErr)
+				}
+				fp.flag &^= faDIRTY
+			}
+			sect := fs.clst2sect(fp.clust)
+			if sect == 0 {
+				return bw, fp.abort(frIntErr)
+			}
+			sect += lba(csect)
+			cc := fs.divSS(uint32(btw))
+			if cc > 0 {
+				if csect+cc > uint32(fs.csize) {
+					cc = uint32(fs.csize) - csect // clip at cluster boundary.
+				}
+				if fs.disk_write(wbuff[:cc*uint32(fs.ssize)], sect, int(cc)) != drOK {
+					return bw, fp.abort(frDiskErr)
+				}
+				off := fp.sect - sect
+				if off < lba(cc) {
+					// Refill sector cache if it gets invalidated by the disk_write().
+					copy(fp.buf[:], wbuff[off*lba(fs.ssize):(off+1)*lba(fs.ssize)])
+					fp.flag &^= faDIRTY
+				}
+				wcnt = int(cc) * int(fs.ssize)
+				continue
+			}
+			// Fill sector cache with file data.
+			if fp.sect != sect && fp.fptr < fp.obj.objsize &&
+				fs.disk_read(fp.buf[:], sect, 1) != drOK {
+				return bw, fp.abort(frDiskErr)
+			}
+			fp.sect = sect
+		}
+		modss := int(fs.modSS(uint32(fp.fptr)))
+		wcnt = int(fs.ssize) - modss // Remaining bytes in sector.
+		if wcnt > btw {
+			wcnt = btw // Clip it by btw.
+		}
+		copy(fp.buf[modss:], wbuff[:wcnt]) // fit data to the sector.
+		fp.flag |= faDIRTY
+	}
+	fp.flag |= faMODIFIED
+	return bw, fr
+}
+
+func (fs *FS) f_opendir(dp *dir, path string) (fr fileResult) {
+	if dp == nil {
+		return frInvalidObject
+	}
+
+	dp.obj.fs = fs
+
+	fr = dp.follow_path(path)
+	if fr != frOK {
+		if fr == frNoFile {
+			fr = frNoPath
+		}
+		dp.obj.fs = nil
+		return fr
+	}
+
+	if dp.fn[nsFLAG]&nsNONAME == 0 {
+		if dp.obj.attr&amDIR != 0 {
+			// Get object allocation info.
+			if fs.isExfat() {
+				dp.obj.init_alloc_info_sdir(dp)
+			} else {
+				dp.obj.sclust = fs.ld_clust(dp.dir)
+			}
+		} else {
+			fr = frNoPath
+		}
+	}
+	if fr == frOK {
+		dp.obj.id = fs.id
+		fr = dp.sdi(0) // Rewind directory.
+	}
+	if fr == frNoFile {
+		fr = frNoPath
+	}
+	if fr != frOK {
+		dp.obj.fs = nil
+	}
+	return fr
+}
+
+// f_open opens or creates a file.
+func (fsys *FS) f_open(fp *File, name string, mode accessmode) fileResult {
+	fsys.trace("f_open", slog.String("name", name), slog.Uint64("mode", uint64(mode)))
+	if fp == nil {
+		return frInvalidObject
+	} else if fsys.perm == 0 {
+		return frDenied
+	}
+	var dj dir
+	fp.obj.fs = fsys
+	dj.obj.fs = fsys
+	res := dj.follow_path(name)
+	if res == frOK {
+		if dj.fn[nsFLAG]&nsNONAME != 0 {
+			res = frInvalidName // Original directory.
+		}
+	}
+	if mode&(faCreateAlways|faOpenAlways|faCreateNew) != 0 {
+		// Create a new file branch.
+		if res != frOK {
+			if res == frNoFile {
+				res = dj.register()
+			}
+			mode |= faCreateAlways
+		} else {
+			if dj.obj.attr&(amRDO|amDIR) != 0 {
+				// Cannot overwrite it (R/O or DIR).
+				res = frDenied
+			} else if mode&faCreateNew != 0 {
+				// Cannot create as new file.
+				res = frExist
+			}
+		}
+		if res == frOK && (mode&faCreateAlways) != 0 {
+			// Truncate file if overwrite mode.
+			tm := fsys.time()
+			if fsys.isExfat() {
+				res = fp.open_trunc_exfat(&dj, tm)
+			} else {
+				binary.LittleEndian.PutUint32(dj.dir[dirCrtTimeOff:], tm)
+				binary.LittleEndian.PutUint32(dj.dir[dirModTimeOff:], tm)
+				cl := fsys.ld_clust(dj.dir) // Get current cluster chain.
+				dj.dir[dirAttrOff] = amARC  // Reset attribute.
+				fsys.st_clust(dj.dir, 0)    // Reset file allocation info.
+				binary.LittleEndian.PutUint32(dj.dir[dirFileSizeOff:], 0)
+				fsys.wflag = 1
+				if cl != 0 {
+					sc := fsys.winsect
+					res = fp.obj.remove_chain(cl, 0)
+					if res == frOK {
+						res = fsys.move_window(sc)
+						fsys.last_clst = cl - 1 // Reuse the cluster hole.
+					}
+				}
+			}
+		}
+	} else {
+		// Open an existing file branch.
+		if res == frOK {
+			if dj.obj.attr&amDIR != 0 {
+				// It is a directory.
+				res = frNoFile
+			} else if mode&faWrite != 0 && dj.obj.attr&amRDO != 0 {
+				// R/O violation.
+				res = frDenied
+			}
+		}
+	}
+	if res != frOK {
+		fp.obj.fs = nil
+		return res
+	}
+
+	if mode&faCreateAlways != 0 {
+		mode |= faMODIFIED
+	}
+	fp.dir_sect = fsys.winsect
+	fp.dir_ptr = dj.dir
+
+	// Get object allocation info.
+	if fsys.isExfat() {
+		fp.obj.fs = fsys
+		fp.obj.init_alloc_info_sdir(&dj)
+	} else {
+		fp.obj.sclust = fsys.ld_clust(dj.dir)
+		fp.obj.objsize = int64(binary.LittleEndian.Uint32(dj.dir[dirFileSizeOff:]))
+	}
+
+	fp.obj.fs = fsys
+	fp.obj.id = fsys.id
+	fp.flag = mode
+	fp.err = 0
+	fp.sect = 0
+	fp.fptr = 0
+	fp.pos = 0
+	fp.buf = [512]byte{} // Clear sector buffer.
+
+	if mode&faAppend != 0 && fp.obj.objsize > 0 {
+		fp.fptr = fp.obj.objsize
+	}
+
+	if mode&faAppend != 0 && fp.obj.objsize > 0 {
+		// Seek to end of file. i.e: if Append mode is passed.
+		fp.fptr = fp.obj.objsize
+		bcs := fsys.csize * fsys.ssize
+		clst := fp.obj.sclust
+		ofs := fp.obj.objsize
+		for ; res == frOK && ofs > int64(bcs); ofs -= int64(bcs) {
+			clst = fp.obj.clusterstat(clst)
+			if clst <= 1 {
+				res = frIntErr
+			} else if clst == badCluster {
+				res = frDiskErr
+			}
+		}
+		fp.clust = clst
+		if res == frOK && fsys.modSS(uint32(ofs)) != 0 {
+			sc := fsys.clst2sect(clst)
+			if sc == 0 {
+				res = frIntErr
+			} else {
+				// here we actually perform division and cast to 64bit to avoid underflow.
+				fp.sect = sc + lba(ofs/int64(fsys.ssize))
+				if fsys.disk_read(fp.buf[:], fp.sect, 1) != drOK {
+					res = frDiskErr
+				}
+			}
+		}
+	}
+	fp.pos = 0
+	if res != frOK {
+		fp.obj.fs = nil
+	}
+	return res
+}
+
+// createLinkmap as f_lseek offset argument triggers creation of the CLMT
+// (cluster link map table) in fp.cltbl for fast seek. Stands in for the
+// C API's CREATE_LINKMAP ((FSIZE_t)0 - 1) which is not representable once
+// offsets are signed.
+const createLinkmap = int64(-1)
+
+// f_lseek moves the file read/write pointer of an open file to the absolute
+// byte offset ofs from the top of the file. Seeking past the end of a file in
+// write mode stretches the cluster chain (the gap contents are undefined,
+// matching FatFs). If fp.cltbl is set, fast seek is used; passing
+// createLinkmap as ofs builds the table.
+func (fp *File) f_lseek(ofs int64) (res fileResult) {
+	fsys := fp.obj.fs
+	fsys.trace("f_lseek", slog.Int64("ofs", ofs))
+	res = fp.obj.validate()
+	if res != frOK {
+		return res
+	} else if fp.err != frOK {
+		return fp.err
+	} else if ofs == fp.fptr {
+		return frOK
+	}
+	if fsys.isExfat() {
+		// Fill last fragment on the FAT if needed.
+		res = fp.obj.fill_last_frag(fp.clust, badCluster)
+		if res != frOK {
+			return res
+		}
+	}
+	ss := int64(fsys.ssize)
+
+	if fp.cltbl != nil {
+		// Fast seek.
+		if ofs == createLinkmap {
+			// Create CLMT.
+			tbl := fp.cltbl[1:]
+			tlen := fp.cltbl[0] // Given table size.
+			ulen := uint32(2)   // Required table size.
+			cl := fp.obj.sclust // Origin of the chain.
+			if cl != 0 {
+				for {
+					// Get a fragment.
+					tcl := cl // Top of the fragment.
+					ncl := uint32(0)
+					ulen += 2
+					for {
+						pcl := cl
+						ncl++
+						cl = fp.obj.clusterstat(cl)
+						if cl <= 1 {
+							return fp.abort(frIntErr)
+						} else if cl == badCluster {
+							return fp.abort(frDiskErr)
+						}
+						if cl != pcl+1 {
+							break
+						}
+					}
+					if ulen <= tlen {
+						// Store the length and top of the fragment.
+						tbl[0] = ncl
+						tbl[1] = tcl
+						tbl = tbl[2:]
+					}
+					if cl >= fsys.n_fatent {
+						break // End of chain.
+					}
+				}
+			}
+			fp.cltbl[0] = ulen // Number of items used.
+			if ulen <= tlen {
+				tbl[0] = 0 // Terminate table.
+			} else {
+				res = frNotEnoughCore // Given table size is smaller than required.
+			}
+			return res
+		}
+		// Fast seek to ofs.
+		if ofs > fp.obj.objsize {
+			ofs = fp.obj.objsize // Clip offset at the file size.
+		}
+		fp.fptr = ofs
+		if ofs > 0 {
+			fp.clust = fp.clmt_clust(ofs - 1)
+			dsc := fsys.clst2sect(fp.clust)
+			if dsc == 0 {
+				return fp.abort(frIntErr)
+			}
+			dsc += lba(uint32((ofs-1)/ss) & uint32(fsys.csize-1))
+			if fp.fptr%ss != 0 && dsc != fp.sect {
+				// Refill sector cache if needed.
+				if fp.flag&faDIRTY != 0 {
+					// Write-back dirty sector cache.
+					if fsys.disk_write(fp.buf[:], fp.sect, 1) != drOK {
+						return fp.abort(frDiskErr)
+					}
+					fp.flag &^= faDIRTY
+				}
+				if fsys.disk_read(fp.buf[:], dsc, 1) != drOK {
+					return fp.abort(frDiskErr)
+				}
+				fp.sect = dsc
+			}
+		}
+		return res
+	}
+
+	// Normal seek.
+	if fsys.fstype != FormatExFAT && ofs >= 0x1_0000_0000 {
+		ofs = 0xFFFF_FFFF // Clip at 4 GiB - 1 for FATxx.
+	}
+	if ofs > fp.obj.objsize && fp.flag&faWrite == 0 {
+		// In read-only mode, clip offset with the file size.
+		ofs = fp.obj.objsize
+	}
+	ifptr := fp.fptr
+	fp.fptr = 0
+	var nsect lba
+	if ofs > 0 {
+		bcs := int64(fsys.csize) * ss // Cluster size in bytes.
+		var clst uint32
+		if ifptr > 0 && (ofs-1)/bcs >= (ifptr-1)/bcs {
+			// When seek to same or following cluster, start from the current cluster.
+			fp.fptr = (ifptr - 1) &^ (bcs - 1)
+			ofs -= fp.fptr
+			clst = fp.clust
+		} else {
+			// When seek to back cluster, start from the first cluster.
+			clst = fp.obj.sclust
+			if clst == 0 {
+				// If no cluster chain, create a new chain.
+				clst = fp.obj.create_chain(0)
+				if clst == 1 {
+					return fp.abort(frIntErr)
+				} else if clst == badCluster {
+					return fp.abort(frDiskErr)
+				}
+				fp.obj.sclust = clst
+			}
+			fp.clust = clst
+		}
+		if clst != 0 {
+			for ofs > bcs {
+				// Cluster following loop.
+				ofs -= bcs
+				fp.fptr += bcs
+				if fp.flag&faWrite != 0 {
+					if fsys.isExfat() && fp.fptr > fp.obj.objsize {
+						// No-FAT-chain object needs correct objsize to generate FAT values.
+						fp.obj.objsize = fp.fptr
+						fp.flag |= faMODIFIED
+					}
+					// Follow chain with forced stretch when in write mode.
+					clst = fp.obj.create_chain(clst)
+					if clst == 0 {
+						// Clip file size in case of disk full.
+						ofs = 0
+						break
+					}
+				} else {
+					// Follow cluster chain if not in write mode.
+					clst = fp.obj.clusterstat(clst)
+				}
+				if clst == badCluster {
+					return fp.abort(frDiskErr)
+				} else if clst <= 1 || clst >= fsys.n_fatent {
+					return fp.abort(frIntErr)
+				}
+				fp.clust = clst
+			}
+			fp.fptr += ofs
+			if ofs%ss != 0 {
+				nsect = fsys.clst2sect(clst) // Current sector.
+				if nsect == 0 {
+					return fp.abort(frIntErr)
+				}
+				nsect += lba(ofs / ss)
+			}
+		}
+	}
+	if fp.fptr > fp.obj.objsize {
+		// Set file change flag if the file size is extended.
+		fp.obj.objsize = fp.fptr
+		fp.flag |= faMODIFIED
+	}
+	if fp.fptr%ss != 0 && nsect != fp.sect {
+		// Fill sector cache if needed.
+		if fp.flag&faDIRTY != 0 {
+			// Write-back dirty sector cache.
+			if fsys.disk_write(fp.buf[:], fp.sect, 1) != drOK {
+				return fp.abort(frDiskErr)
+			}
+			fp.flag &^= faDIRTY
+		}
+		if fsys.disk_read(fp.buf[:], nsect, 1) != drOK {
+			return fp.abort(frDiskErr)
+		}
+		fp.sect = nsect
+	}
+	return frOK
+}
+
+// f_truncate truncates the file to the current read/write pointer,
+// removing the cluster chain past fptr. No-op when fptr is at or past EOF.
+func (fp *File) f_truncate() (res fileResult) {
+	fsys := fp.obj.fs
+	fsys.trace("f_truncate")
+	if fp.fptr >= fp.obj.objsize {
+		return frOK
+	}
+	if fp.fptr == 0 {
+		// Set file size to zero: remove entire cluster chain.
+		res = fp.obj.remove_chain(fp.obj.sclust, 0)
+		fp.obj.sclust = 0
+	} else {
+		// Truncate part of the file: remove clusters after the current one.
+		ncl := fp.obj.clusterstat(fp.clust)
+		res = frOK
+		if ncl == badCluster {
+			res = frDiskErr
+		} else if ncl == 1 {
+			res = frIntErr
+		}
+		if res == frOK && ncl < fsys.n_fatent {
+			res = fp.obj.remove_chain(ncl, fp.clust)
+		}
+	}
+	fp.obj.objsize = fp.fptr // Set file size to current read/write point.
+	fp.flag |= faMODIFIED
+	if res == frOK && fp.flag&faDIRTY != 0 {
+		if fsys.disk_write(fp.buf[:], fp.sect, 1) != drOK {
+			res = frDiskErr
+		} else {
+			fp.flag &^= faDIRTY
+		}
+	}
+	if res != frOK {
+		return fp.abort(res)
+	}
+	return frOK
+}
+
+// f_unlink removes a file or an empty sub-directory at path.
+func (fsys *FS) f_unlink(path string) (res fileResult) {
+	fsys.trace("f_unlink", slog.String("path", path))
+	if fsys.perm&ModeWrite == 0 {
+		return frWriteProtected
+	}
+	var dj dir
+	dj.obj.fs = fsys
+	res = dj.follow_path(path)
+	if res != frOK {
+		return res
+	} else if dj.fn[nsFLAG]&(nsDOT|nsNONAME) != 0 {
+		return frInvalidName // It must be a real object.
+	} else if dj.obj.attr&amRDO != 0 {
+		return frDenied // The object must not be read-only.
+	}
+	// exFAT: a standalone object carries the allocation info so remove_chain
+	// sees the correct contiguity status.
+	var obj objid
+	var dclst uint32
+	if fsys.isExfat() {
+		obj.fs = fsys
+		obj.init_alloc_info()
+		dclst = obj.sclust
+	} else {
+		dclst = fsys.ld_clust(dj.dir)
+	}
+	if dj.obj.attr&amDIR != 0 {
+		// The object is a sub-directory: it must be empty to be removed.
+		var sdj dir
+		sdj.obj.fs = fsys
+		sdj.obj.sclust = dclst
+		if fsys.isExfat() {
+			sdj.obj.objsize = obj.objsize
+			sdj.obj.stat = obj.stat
+		}
+		res = sdj.sdi(0)
+		if res != frOK {
+			return res
+		}
+		res = sdj.read(false)
+		if res == frOK {
+			return frDenied // Not empty.
+		} else if res != frNoFile {
+			return res
+		}
+	}
+	// It is ready to remove the object.
+	res = dj.dir_remove()
+	if res == frOK && dclst != 0 {
+		// Remove the cluster chain if it exists.
+		if fsys.isExfat() {
+			res = obj.remove_chain(dclst, 0)
+		} else {
+			res = dj.obj.remove_chain(dclst, 0)
+		}
+	}
+	if res == frOK {
+		res = fsys.sync()
+	}
+	return res
+}
+
+// f_stat looks up the file or sub-directory at path and stores its
+// information into fno when non-nil. Returns frInvalidName for the origin
+// (root) directory since it has no directory entry of its own.
+func (fsys *FS) f_stat(path string, fno *FileInfo) (res fileResult) {
+	fsys.trace("f_stat", slog.String("path", path))
+	var dj dir
+	dj.obj.fs = fsys
+	res = dj.follow_path(path)
+	if res == frOK {
+		if dj.fn[nsFLAG]&nsNONAME != 0 {
+			res = frInvalidName // It is origin directory.
+		} else if fno != nil {
+			dj.get_fileinfo(fno)
+		}
+	}
+	if fno != nil && res != frOK {
+		fno.fname[0] = 0 // Invalidate file information on error.
+	}
+	return res
+}
+
+// f_getlabel appends the volume label to dst and returns the extended buffer.
+// A volume with no label entry in its root directory has an empty label and
+// appends nothing. Ported from FatFs' f_getlabel; the volume serial number is
+// available from the boot sector, see [biosParamBlock].
+func (fsys *FS) f_getlabel(dst []byte) ([]byte, fileResult) {
+	fsys.trace("f_getlabel")
+	if fsys.fstype == _FormatUnknown {
+		return dst, frNoFilesystem // Not mounted.
+	}
+	var dj dir
+	dj.obj.fs = fsys
+	dj.obj.sclust = 0 // Open the root directory.
+	fr := dj.sdi(0)
+	if fr != frOK {
+		return dst, fr
+	}
+	fr = dj.read(true) // Find the volume label entry.
+	if fr == frNoFile {
+		return dst, frOK // No label entry: the label is the empty string.
+	} else if fr != frOK {
+		return dst, fr
+	}
+	if fsys.isExfat() {
+		return fsys.getlabel_exfat(dst, dj.dir), frOK
+	}
+	return fsys.getlabel_sfn(dst, dj.dir), frOK
+}
+
+// f_mkdir creates a new sub-directory at path.
+func (fsys *FS) f_mkdir(path string) (res fileResult) {
+	fsys.trace("f_mkdir", slog.String("path", path))
+	if fsys.perm&ModeWrite == 0 {
+		return frWriteProtected
+	}
+	var dj dir
+	dj.obj.fs = fsys
+	res = dj.follow_path(path)
+	if res == frOK {
+		if dj.fn[nsFLAG]&(nsDOT|nsNONAME) != 0 {
+			return frInvalidName
+		}
+		return frExist // Name collision.
+	} else if res != frNoFile {
+		return res
+	}
+
+	// It is clear to create a new directory.
+	sobj := objid{fs: fsys}     // New object ID to create a new chain.
+	dcl := sobj.create_chain(0) // Allocate a cluster for the new directory table.
+	switch dcl {
+	case 0:
+		return frDenied // No space to allocate a new cluster.
+	case 1:
+		return frIntErr
+	case badCluster:
+		return frDiskErr
+	}
+	tm := fsys.time()
+	res = fsys.dir_clear(dcl) // Clean up the new table.
+	if res == frOK {
+		if !fsys.isExfat() {
+			// Create dot entries: "." then ".." (FAT only, exFAT has none).
+			// dir_clear left the window at the top of the new cluster with
+			// zeroed contents.
+			for i := 0; i < 11; i++ {
+				fsys.win[dirNameOff+i] = ' '
+			}
+			fsys.win[dirNameOff] = '.'
+			fsys.win[dirAttrOff] = amDIR
+			binary.LittleEndian.PutUint32(fsys.win[dirModTimeOff:], tm)
+			fsys.st_clust(fsys.win[:], dcl)
+			copy(fsys.win[sizeDirEntry:2*sizeDirEntry], fsys.win[:sizeDirEntry]) // Create ".." entry.
+			fsys.win[sizeDirEntry+1] = '.'
+			fsys.st_clust(fsys.win[sizeDirEntry:], dj.obj.sclust) // Containing directory; 0 means root.
+			fsys.wflag = 1
+		}
+		res = dj.register() // Register the object to the parent directory.
+	}
+	if res != frOK {
+		sobj.remove_chain(dcl, 0) // Could not register, remove the allocated cluster.
+		return res
+	}
+	if fsys.isExfat() {
+		// Initialize the new directory's entry set.
+		res = dj.mkdir_fin_exfat(dcl, tm)
+		if res != frOK {
+			return res
+		}
+	} else {
+		binary.LittleEndian.PutUint32(dj.dir[dirCrtTimeOff:], tm)
+		binary.LittleEndian.PutUint32(dj.dir[dirModTimeOff:], tm)
+		fsys.st_clust(dj.dir, dcl) // Table start cluster.
+		dj.dir[dirAttrOff] = amDIR
+		fsys.wflag = 1
+	}
+	return fsys.sync()
+}
+
+// f_rename renames and/or moves the file or sub-directory at oldpath to newpath.
+func (fsys *FS) f_rename(oldpath, newpath string) (res fileResult) {
+	fsys.trace("f_rename", slog.String("old", oldpath), slog.String("new", newpath))
+	if fsys.perm&ModeWrite == 0 {
+		return frWriteProtected
+	}
+	var djo dir
+	djo.obj.fs = fsys
+	res = djo.follow_path(oldpath) // Check old object.
+	if res != frOK {
+		return res
+	} else if djo.fn[nsFLAG]&(nsDOT|nsNONAME) != 0 {
+		return frInvalidName // The object must be a real object.
+	}
+	isEx := fsys.isExfat()
+	var buf [2 * sizeDirEntry]byte
+	if isEx {
+		copy(buf[:], fsys.dirbuf[:]) // Save 85+C0 entry of old object.
+	} else {
+		copy(buf[:], djo.dir[:sizeDirEntry]) // Save directory entry of the object.
+	}
+	djn := djo                     // Duplicate the directory object.
+	res = djn.follow_path(newpath) // Make sure new object name is not in use.
+	if res == frOK {
+		// Is new name already in use by another object?
+		if djn.obj.sclust == djo.obj.sclust && djn.dptr == djo.dptr {
+			res = frNoFile
+		} else {
+			res = frExist
+		}
+	}
+	if res != frNoFile {
+		return res // It is a valid path and no name collision only on frNoFile.
+	}
+	res = djn.register() // Register the new entry.
+	if res != frOK {
+		return res
+	}
+	// Start of critical section where an interruption can cause a cross-link.
+	if isEx {
+		res = djn.rename_restore_exfat(&buf)
+	} else {
+		// Copy directory entry of the object except name.
+		bdir := djn.dir
+		copy(bdir[13:sizeDirEntry], buf[13:sizeDirEntry])
+		bdir[dirAttrOff] = buf[dirAttrOff]
+		if bdir[dirAttrOff]&amDIR == 0 {
+			bdir[dirAttrOff] |= amARC // Set archive attribute if it is a file.
+		}
+		fsys.wflag = 1
+		if bdir[dirAttrOff]&amDIR != 0 && djo.obj.sclust != djn.obj.sclust {
+			// Update ".." entry in the sub-directory being moved to a new containing directory.
+			sect := fsys.clst2sect(fsys.ld_clust(bdir))
+			if sect == 0 {
+				return frIntErr
+			}
+			res = fsys.move_window(sect)
+			bdir = fsys.win[sizeDirEntry:] // Pointer to ".." entry.
+			if res == frOK && bdir[1] == '.' {
+				fsys.st_clust(bdir, djn.obj.sclust)
+				fsys.wflag = 1
+			}
+		}
+	}
+	if res == frOK {
+		res = djo.dir_remove() // Remove old entry.
+		if res == frOK {
+			res = fsys.sync()
+		}
+	}
+	// End of the critical section.
+	return res
+}
+
+// dir_remove removes the directory entry pointed to by dp, including the LFN
+// entries of the block when present.
+func (dp *dir) dir_remove() (res fileResult) {
+	fsys := dp.obj.fs
+	fsys.trace("dir:dir_remove")
+	last := dp.dptr
+	if dp.blk_ofs == badLBA {
+		res = frOK // SFN only, no LFN entries.
+	} else {
+		res = dp.sdi(dp.blk_ofs) // Go to top of the entry block.
+	}
+	if res != frOK {
+		return res
+	}
+	for {
+		res = fsys.move_window(dp.sect)
+		if res != frOK {
+			break
+		}
+		if fsys.isExfat() {
+			dp.dir[xdirType] &^= etMaskUsed // Clear the entry InUse flag.
+		} else {
+			dp.dir[dirNameOff] = mskDDEM // Mark the entry 'deleted'.
+		}
+		fsys.wflag = 1
+		if dp.dptr >= last {
+			break // All entries of the object have been deleted.
+		}
+		res = dp.next(false) // Next entry.
+		if res != frOK {
+			break
+		}
+	}
+	if res == frNoFile {
+		res = frIntErr
+	}
+	return res
+}
+
+func (dp *dir) f_readdir(fno *FileInfo) fileResult {
+	fsys := dp.obj.fs
+	fsys.trace("dir:f_readdir")
+	fr := dp.obj.validate()
+	if fr != frOK {
+		return fr
+	}
+	if fno == nil {
+		fr = dp.sdi(0)
+	} else {
+		// Read an item.
+		fr = dp.read(false)
+		if fr == frNoFile {
+			fr = frOK // Ignore end of directory.
+		}
+		if fr == frOK {
+			dp.get_fileinfo(fno)
+			fr = dp.next(false) // Increment index for next.
+			if fr == frNoFile {
+				// Ignore end of directory until next call
+				// since we succesfully read fileinfo.
+				fr = frOK
+			}
+		}
+	}
+	return fr
+}
+
+func (dp *dir) read(vol bool) (fr fileResult) {
+	fsys := dp.obj.fs
+	fsys.trace("dir:read", slog.Bool("vol", vol))
+	if fsys.isExfat() {
+		return dp.read_exfat(vol)
+	}
+	var ord, sum byte
+	for dp.sect != 0 {
+		fr = fsys.move_window(dp.sect)
+		if fr != frOK {
+			break
+		}
+		b := dp.dir[dirNameOff]
+		if b == 0 {
+			fr = frNoFile
+			break
+		}
+		// TODO: implement exFAT here.
+		attr := dp.dir[dirAttrOff] & amMASK
+		dp.obj.attr = attr
+		if b == mskDDEM || b == '.' || (attr&^amARC == amVOL) != vol {
+			// Entry without valid data.
+			ord = 0xff
+		} else {
+			if attr == amLFN {
+				if b&mskLLEF != 0 {
+					sum = dp.dir[ldirChksumOff]
+					b &^= mskLLEF
+					ord = b
+					dp.blk_ofs = dp.dptr
+				}
+				// Store LFN validity.
+				if b == ord && sum == dp.dir[ldirChksumOff] && fsys.pick_lfn(dp.dir) {
+					ord--
+				} else {
+					ord = 0xff
+				}
+			} else {
+				if ord != 0 || sum != sum_sfn(dp.dir) {
+					dp.blk_ofs = badLBA // No LFN.
+				}
+				break
+			}
+		}
+		fr = dp.next(false)
+		if fr != frOK {
+			break
+		}
+	}
+	if fr != frOK {
+		dp.sect = 0 // Terminate read op on EOT.
+	}
+	return fr
+}
+
+func (fsys *FS) sync() fileResult {
+	fsys.trace("fs:sync")
+	fr := fsys.sync_window()
+	if fr != frOK || fsys.fsi_flag != 1 {
+		return fr
+	}
+	fsys.fsi_flag = 0
+	if fsys.fstype == FormatFAT32 {
+		// Create FSInfo structure.
+		fsys.window_clr()
+		binary.LittleEndian.PutUint16(fsys.win[bs55AA:], 0xAA55)
+		binary.LittleEndian.PutUint32(fsys.win[fsiLeadSig:], 0x41615252)
+		binary.LittleEndian.PutUint32(fsys.win[fsiStrucSig:], 0x61417272)
+		binary.LittleEndian.PutUint32(fsys.win[fsiFree_Count:], fsys.free_clst)
+		binary.LittleEndian.PutUint32(fsys.win[fsiNxt_Free:], fsys.last_clst)
+		fsys.winsect = fsys.volbase + 1
+		fsys.disk_write(fsys.win[:], fsys.winsect, 1) // Write backup copy.
+	} else if fsys.isExfat() {
+		// Update the PercInUse field in the VBR.
+		fsys.winsect = fsys.volbase
+		if fsys.disk_read(fsys.win[:], fsys.winsect, 1) == drOK {
+			var perc byte = 0xFF // Unknown.
+			if fsys.free_clst <= fsys.n_fatent-2 {
+				perc = byte(uint64(fsys.n_fatent-2-fsys.free_clst) * 100 / uint64(fsys.n_fatent-2))
+			}
+			if fsys.win[bpbPercInUseEx] != perc {
+				fsys.win[bpbPercInUseEx] = perc
+				fsys.disk_write(fsys.win[:], fsys.winsect, 1)
+			}
+		}
+	}
+	return fr
+}
+
+// mount initializes the FS with the given BlockDevice.
+func (fsys *FS) mount_volume(bd BlockDevice, ssize uint16, mode uint8) (fr fileResult) {
+	fsys.trace("fs:mount_volume", slog.Int("mode", int(mode)))
+	fsys.fstype = _FormatUnknown // Invalidate any previous mount.
+	// From here on out we call mount_volume since we don't care about
+	// mutexes or file path handling. File path handling is left to
+	// the Go standard library which does a much better job than us.
+	// See `filepath` and `fs` standard library packages.
+
+	blk, err := makeBlockIndexer(int(ssize))
+	if err != nil {
+		return frInvalidParameter
+	}
+	fsys.device = bd
+	fsys.id++ // Invalidate open files.
+	fsys.blk = blk
+	fsys.ssize = ssize
+	fsys.perm = Mode(mode)
+	fmt := fsys.find_volume(0)
+
+	if fmt == bootsectorstatusDiskError {
+		return frDiskErr
+	} else if fmt == bootsectorstatusNotFATInvalidBS || fmt == bootsectorstatusNotFATValidBS {
+		return frNoFilesystem
+	}
+	fsys.initNames()
+	if fmt == bootsectorstatusExFAT {
+		return fsys.init_exfat()
+	}
+	return fsys.init_fat()
+}
+
+func (fp *File) clmt_clust(ofs int64) (cl uint32) {
+	fsys := fp.obj.fs
+	fsys.trace("fp:clmt_clust", slog.Int64("ofs", ofs))
+	tbl := fp.cltbl[1:] // Top of CLMT.
+	cl = uint32(ofs / int64(fsys.ssize) / int64(fsys.csize))
+	for {
+		ncl := tbl[0] // Number of clusters in the fragment.
+		tbl = tbl[1:]
+		if ncl == 0 {
+			return 0 // End of table (error).
+		} else if cl < ncl {
+			break // In this fragment.
+		}
+		cl -= ncl // Next fragment.
+		tbl = tbl[1:]
+	}
+	return cl + tbl[0] // tbl[0] is the top cluster of the fragment.
+}
+
+func (fsys *FS) init_fat() fileResult { // Part of mount_volume.
+	fsys.trace("fs:init_fat")
+	baseSector := fsys.winsect
+	ss := fsys.ssize
+	if fsys.window_u16(bpbBytsPerSec) != uint16(ss) {
+		return frInvalidParameter
+	}
+	// Number of sectors per FAT.
+	sectorsPerFAT := uint32(fsys.window_u16(bpbFATSz16))
+	if sectorsPerFAT == 0 {
+		sectorsPerFAT = fsys.window_u32(bpbFATSz32)
+	}
+	fsys.fsize = sectorsPerFAT
+	fsys.nFATs = fsys.win[bpbNumFATs]
+	if fsys.nFATs != 1 && fsys.nFATs != 2 {
+		return frNoFilesystem
+	}
+	sectorsPerFAT *= uint32(fsys.nFATs)
+	fsys.csize = uint16(fsys.win[bpbSecPerClus])
+	if fsys.csize == 0 || (fsys.csize&(fsys.csize-1)) != 0 {
+		// Zero or not power of two.
+		return frNoFilesystem
+	}
+
+	fsys.nrootdir = fsys.window_u16(bpbRootEntCnt)
+	if fsys.nrootdir%(ss/32) != 0 {
+		// Is not sector aligned.
+		return frNoFilesystem
+	}
+
+	// Number of sectors on the volume.
+	sectorsTotal := uint32(fsys.window_u16(bpbTotSec16))
+	if sectorsTotal == 0 {
+		sectorsTotal = fsys.window_u32(bpbTotSec32)
+	}
+
+	// Number of reserved sectors.
+	sectorsReserved := fsys.window_u16(bpbRsvdSecCnt)
+	if sectorsReserved == 0 {
+		return frNoFilesystem
+	}
+
+	// Determine the FAT subtype. RSV+FAT+DIR
+	const sizeDirEntry = 32
+	sectorsNonApplication := uint32(sectorsReserved) + sectorsPerFAT + uint32(fsys.nrootdir)/(uint32(ss)/sizeDirEntry)
+	clustersTotal := (sectorsTotal - sectorsNonApplication) / uint32(fsys.csize)
+	if sectorsTotal < sectorsNonApplication || clustersTotal == 0 {
+		return frNoFilesystem
+	}
+	var fmt Format = FormatFAT12
+	switch {
+	case clustersTotal > clustMaxFAT32:
+		return frNoFilesystem // Too many clusters for FAT32.
+	case clustersTotal > clustMaxFAT16:
+		fmt = FormatFAT32
+	case clustersTotal > clustMaxFAT12:
+		fmt = FormatFAT16
+	}
+
+	// Boundaries and limits.
+	fsys.n_fatent = clustersTotal + 2
+	fsys.volbase = baseSector
+	fsys.fatbase = baseSector + lba(sectorsReserved)
+	fsys.database = baseSector + lba(sectorsNonApplication)
+	var neededSizeOfFAT uint32
+	if fmt == FormatFAT32 {
+		if fsys.window_u16(bpbFSVer32) != 0 {
+			return frNoFilesystem // Unsupported FAT subversion, must be 0.0.
+		} else if fsys.nrootdir != 0 {
+			return frNoFilesystem // Root directory entry count must be 0.
+		}
+		fsys.dirbase = lba(fsys.window_u32(bpbRootClus32))
+		neededSizeOfFAT = fsys.n_fatent * 4
+	} else {
+		if fsys.nrootdir == 0 {
+			return frNoFilesystem // Root directory entry count must not be 0.
+		}
+		fsys.dirbase = fsys.fatbase + lba(sectorsPerFAT)
+		if fmt == FormatFAT16 {
+			neededSizeOfFAT = fsys.n_fatent * 2
+		} else {
+			neededSizeOfFAT = fsys.n_fatent*3/2 + fsys.n_fatent&1
+		}
+	}
+	sectorsNeeded := (neededSizeOfFAT + uint32(ss-1)) / uint32(ss)
+	if fsys.fsize < sectorsNeeded {
+		// TODO(soypat): failing FAT size compare here.
+		fsys.logerror("init_fat:sectorsNeeded", slog.Int("sectorsNeeded", int(sectorsNeeded)))
+		// return frNoFilesystem // FAT size must not be less than FAT sectors.
+	}
+	// Initialize cluster allocation information for write ops.
+	fsys.last_clst = 0xffff_ffff
+	fsys.free_clst = 0xffff_ffff
+	fsys.fsi_flag = 1 << 7
+
+	// Update FSInfo.
+	if fmt == FormatFAT32 && fsys.window_u16(bpbFSInfo32) == 1 && fsys.move_window(baseSector+1) == frOK {
+		fsys.fsi_flag = 0
+		ok := fsys.window_u16(bs55AA) == 0xaa55 && fsys.window_u32(fsiLeadSig) == 0x41615252 &&
+			fsys.window_u32(fsiStrucSig) == 0x61417272
+		if ok {
+			fsys.free_clst = fsys.window_u32(fsiFree_Count)
+			fsys.last_clst = fsys.window_u32(fsiNxt_Free)
+		}
+	}
+	fsys.fstype = fmt // Validate the filesystem.
+	fsys.id++         // Increment filesystem ID, invalidates open files.
+	return frOK
+}
+
+func (fsys *FS) disk_status() diskstatus {
+	return 0
+}
+
+func (fsys *FS) find_volume(part int64) bootsectorstatus {
+	fsys.trace("fs:find_volume", slog.Int64("part", part))
+	const (
+		sizePTE  = 16
+		startPTE = 8
+	)
+	var mbr_pt [4]uint32
+	fmt := fsys.check_fs(0)
+	if fmt != 2 && (fmt >= 3 || part == 0) {
+		// Returns if it is an FAT VBR as auto scan, not a BS or disk error.
+		return fmt
+	}
+	if fsys.win[offsetMBRTable+4] == 0xEE {
+		return fsys.find_gpt_volume(part)
+	}
+	// Read partition table.
+	if part > 4 {
+		// MBR has 4 partitions max.
+		return bootsectorstatusNotFATInvalidBS
+	}
+	// Read partition table.
+	var i uint16
+	for i = 0; i < 4; i++ {
+		offset := offsetMBRTable + sizePTE*i + startPTE
+		mbr_pt[i] = binary.LittleEndian.Uint32(fsys.win[offset:])
+	}
+	i = 0
+	if part > 0 {
+		i = uint16(part - 1)
+	}
+	for {
+		fmt = 3
+		if mbr_pt[i] > 0 {
+			// Check if partition is FAT.
+			fmt = fsys.check_fs(lba(mbr_pt[i]))
+		}
+		i++
+		if !(part == 0 && fmt >= 2 && i < 4) {
+			break
+		}
+	}
+	return fmt
+}
+
+func (fsys *FS) find_gpt_volume(part int64) bootsectorstatus {
+	return bootsectorstatusNotFATInvalidBS
+}
+
+// check_fs returns:
+func (fsys *FS) check_fs(sect lba) bootsectorstatus {
+	fsys.trace("fs:check_fs", slog.Uint64("sect", uint64(sect)))
+	const (
+		offsetJMPBoot   = 0
+		offsetSignature = 510
+		offsetFileSys32 = 82
+	)
+	fsys.invalidate_window()
+	fr := fsys.move_window(sect)
+	if fr != frOK {
+		return bootsectorstatusDiskError
+	}
+	bsValid := binary.LittleEndian.Uint16(fsys.win[offsetSignature:]) == 0xaa55
+
+	if bsValid && !fsys.window_memcmp(offsetJMPBoot, "\xEB\x76\x90EXFAT   ") {
+		return bootsectorstatusExFAT // exFAT VBR.
+	}
+	b := fsys.win[offsetJMPBoot]
+	if b == 0xEB || b == 0xE9 || b == 0xE8 {
+		// Valid JumpBoot code (short jump, near jump or near call).
+		if bsValid && !fsys.window_memcmp(offsetFileSys32, "FAT32   ") {
+			return bootsectorstatusFAT // FAT32 VBR.
+		}
+		// FAT volumes created in the early MS-DOS era lack bs55AA and bpbFilSysType,
+		// so FAT VBR needs to be identified without them (FAT12/FAT16).
+		const minSS, maxSS = 512, 4096
+		ss := fsys.window_u16(bpbBytsPerSec)
+		sc := fsys.win[bpbSecPerClus]
+		if ss&(ss-1) == 0 && ss >= minSS && ss <= maxSS && // Properness of sector size (512-4096 and 2^n).
+			sc != 0 && sc&(sc-1) == 0 && // Properness of cluster size (2^n).
+			fsys.window_u16(bpbRsvdSecCnt) != 0 && // Properness of number of reserved sectors (MNBZ).
+			(fsys.win[bpbNumFATs] == 1 || fsys.win[bpbNumFATs] == 2) && // Properness of number of FATs (1 or 2).
+			fsys.window_u16(bpbRootEntCnt) != 0 && // Properness of root dir size (MNBZ).
+			(fsys.window_u16(bpbTotSec16) >= 128 || fsys.window_u32(bpbTotSec32) >= 0x10000) && // Properness of volume size (>=128).
+			fsys.window_u16(bpbFATSz16) != 0 { // Properness of FAT size (MNBZ).
+			return bootsectorstatusFAT // It can be presumed an FAT VBR.
+		}
+	}
+	// Not a FAT VBR, BS may be valid/invalid.
+	return 3 - b2i[bootsectorstatus](bsValid)
+}
+
+func (obj *objid) clusterstat(clst uint32) (val uint32) {
+	fsys := obj.fs
+	fsys.trace("fs:clusterstat", slog.Uint64("clst", uint64(clst)))
+	if clst < 2 || clst >= fsys.n_fatent {
+		return 1 // Internal error
+	}
+	val = 0xffff_ffff // Default value falls on disk error.
+	ss := uint32(fsys.ssize)
+	switch fsys.fstype {
+	default:
+		return 1 // Not supported.
+	case FormatExFAT:
+		return obj.clusterstat_exfat(clst)
+	case FormatFAT12:
+		bc := clst + clst/2 // Byte offset of the entry.
+		if fsys.move_window(fsys.fatbase+lba(bc/ss)) != frOK {
+			break
+		}
+		wc := uint32(fsys.win[bc%ss]) // Get 1st byte of the entry.
+		bc++
+		if fsys.move_window(fsys.fatbase+lba(bc/ss)) != frOK {
+			break
+		}
+		wc |= uint32(fsys.win[bc%ss]) << 8 // Merge 2nd byte of the entry.
+		if clst&1 != 0 {
+			val = wc >> 4 // Adjust bit position.
+		} else {
+			val = wc & 0xFFF
+		}
+	case FormatFAT16:
+		if fsys.move_window(fsys.fatbase+lba(clst/(ss/2))) != frOK {
+			break
+		}
+		val = uint32(binary.LittleEndian.Uint16(fsys.win[clst*2%ss:])) // Simple WORD array.
+	case FormatFAT32:
+		ret := fsys.move_window(fsys.fatbase + lba(clst/(ss/4)))
+		if ret != frOK {
+			fsys.logerror("value:move_window", slog.Int("ret", int(ret)))
+			break
+		}
+		val = binary.LittleEndian.Uint32(fsys.win[clst*4%ss:])
+		val &= mask28bits // FAT32 uses 28bits for cluster address.
+	}
+	return val
+}
+
+// put_clusterstat changes the value of a FAT entry.
+func (fsys *FS) put_clusterstat(cluster, value uint32) fileResult {
+	fsys.trace("fs:put_clusterstat", slog.Uint64("cluster", uint64(cluster)), slog.Uint64("value", uint64(value)))
+	if cluster < 2 || cluster >= fsys.n_fatent {
+		return frIntErr // Internal error: cluster out of range.
+	}
+	ss := uint32(fsys.ssize)
+	switch fsys.fstype {
+	default:
+		return frIntErr // Not supported.
+	case FormatFAT12:
+		bc := cluster + cluster/2 // Byte offset of the entry.
+		res := fsys.move_window(fsys.fatbase + lba(bc/ss))
+		if res != frOK {
+			return res
+		}
+		p := &fsys.win[bc%ss]
+		if cluster&1 != 0 { // Update 1st byte.
+			*p = *p&0x0F | byte(value)<<4
+		} else {
+			*p = byte(value)
+		}
+		bc++
+		fsys.wflag = 1
+		res = fsys.move_window(fsys.fatbase + lba(bc/ss))
+		if res != frOK {
+			return res
+		}
+		p = &fsys.win[bc%ss]
+		if cluster&1 != 0 { // Update 2nd byte.
+			*p = byte(value >> 4)
+		} else {
+			*p = *p&0xF0 | byte(value>>8)&0x0F
+		}
+		fsys.wflag = 1
+	case FormatFAT16:
+		res := fsys.move_window(fsys.fatbase + lba(cluster/(ss/2)))
+		if res != frOK {
+			return res
+		}
+		binary.LittleEndian.PutUint16(fsys.win[cluster*2%ss:], uint16(value)) // Simple WORD array.
+		fsys.wflag = 1
+	case FormatFAT32, FormatExFAT: // Similar for both FAT32 and exFAT.
+		res := fsys.move_window(fsys.fatbase + lba(cluster/(ss/4)))
+		if res != frOK {
+			return res
+		}
+		winIdx := cluster * 4 % ss
+		if fsys.fstype != FormatExFAT {
+			value = (value & mask28bits) |
+				(binary.LittleEndian.Uint32(fsys.win[winIdx:]) &^ mask28bits)
+		}
+		binary.LittleEndian.PutUint32(fsys.win[winIdx:], value)
+		fsys.wflag = 1
+	}
+	return frOK
+}
+
+func (fsys *FS) move_window(sector lba) (fr fileResult) {
+	fsys.trace("fs:move_window", slog.Uint64("sector", uint64(sector)))
+	if sector == fsys.winsect {
+		return frOK // Do nothing if window offset not changed.
+	}
+	fr = fsys.sync_window() // Flush window.
+	if fr != frOK {
+		return fr
+	}
+	dr := fsys.disk_read(fsys.win[:], sector, 1)
+	if dr != drOK {
+		fsys.logerror("move_window:dr", slog.Int("dret", int(dr)))
+		sector = badLBA // Invalidate window offset if disk error occured.
+		fr = frDiskErr
+	}
+	fsys.winsect = sector
+	return fr
+}
+
+func (fsys *FS) invalidate_window() {
+	fsys.wflag = 0
+	fsys.winsect = badLBA
+}
+
+func (fsys *FS) window_memcmp(off uint16, data string) bool {
+	areEqual := off+uint16(len(data)) <= uint16(len(fsys.win)) && unsafe.String((*byte)(unsafe.Pointer(&fsys.win[off])), len(data)) == data
+	return !areEqual
+}
+
+func (fsys *FS) window_u32(off uint16) uint32 {
+	fsys.window_boundscheck(off + 4)
+	return binary.LittleEndian.Uint32(fsys.win[off:]) // DWORD size.
+}
+
+func (fsys *FS) window_u16(off uint16) uint16 {
+	fsys.window_boundscheck(off + 2)
+	return binary.LittleEndian.Uint16(fsys.win[off:]) // WORD size.
+}
+
+func (fsys *FS) window_boundscheck(lim uint16) {
+	if lim > uint16(len(fsys.win)) {
+		panic("window_boundscheck: out of bounds")
+	}
+}
+
+func (fsys *FS) sync_window() (fr fileResult) {
+	fsys.trace("fs:sync_window")
+	if fsys.wflag == 0 {
+		return frOK // Diska access window not dirty.
+	}
+	ret := fsys.disk_write(fsys.win[:], fsys.winsect, 1)
+	if ret != drOK {
+		fsys.logerror("sync_window:dw", slog.Int("dret", int(ret)))
+		return frDiskErr
+	}
+	if fsys.nFATs == 2 && fsys.winsect-fsys.fatbase < lba(fsys.fsize) { // Is in 1st FAT?
+		// Reflect it to second FAT if needed.
+		fsys.disk_write(fsys.win[:], fsys.winsect+lba(fsys.fsize), 1) // Redundancy write, ignore error.
+	}
+	fsys.wflag = 0
+	return frOK
+}
+
+// dir_clear fills a cluster with zeros on the disk.
+func (fsys *FS) dir_clear(clst uint32) fileResult {
+	fsys.trace("fs:dir_clear", slog.Uint64("clst", uint64(clst)))
+	if fsys.sync_window() != frOK {
+		return frDiskErr
+	}
+	// Set window to top of the cluster.
+	sect := fsys.clst2sect(clst)
+	fsys.winsect = sect
+	fsys.window_clr()
+	result := fsys.disk_erase(sect, int(fsys.csize))
+	if result != drOK {
+		fsys.logerror("dir_clear:dc", slog.Int("dret", int(result)))
+		return frDiskErr
+	}
+	return frOK
+}
+
+func (fsys *FS) time() uint32 {
+	// meteor-imager patch: FAT timestamp of the current local time (FatFs
+	// get_fattime) instead of 0, which decodes as the invalid date 1980-00-00.
+	t := time.Now()
+	if t.Year() < 1980 || t.Year() > 2107 {
+		return 0
+	}
+	return uint32(t.Year()-1980)<<25 | uint32(t.Month())<<21 | uint32(t.Day())<<16 |
+		uint32(t.Hour())<<11 | uint32(t.Minute())<<5 | uint32(t.Second()/2)
+}
+
+// ld_clust loads start(top) cluster value of the SFN entry using the key entry buffer.
+func (fsys *FS) ld_clust(bdir []byte) (cl uint32) {
+	cl = uint32(binary.LittleEndian.Uint16(bdir[dirFstClusLOOff:]))
+	if fsys.fstype == FormatFAT32 {
+		cl |= uint32(binary.LittleEndian.Uint16(bdir[dirFstClusHIOff:])) << 16
+	}
+	return cl
+}
+
+// st_clust stores a cluster value to the SFN entry using the key entry buffer.
+func (fsys *FS) st_clust(dir []byte, cl uint32) {
+	binary.LittleEndian.PutUint16(dir[dirFstClusLOOff:], uint16(cl))
+	if fsys.fstype == FormatFAT32 {
+		binary.LittleEndian.PutUint16(dir[dirFstClusHIOff:], uint16(cl>>16))
+	}
+}
+
+func (fsys *FS) disk_write(buf []byte, sector lba, numsectors int) diskresult {
+	if fsys.perm&ModeWrite == 0 {
+		return drWriteProtected
+	}
+	fsys.trace("fs:disk_write", slog.Uint64("start", uint64(sector)), slog.Int("numsectors", numsectors))
+	if fsys.blk.off(int64(len(buf))) != 0 || fsys.blk._divideBlockSize(int64(len(buf))) != int64(numsectors) {
+		fsys.logerror("disk_write:unaligned")
+		return drParError
+	}
+	_, err := fsys.device.WriteBlocks(buf, int64(sector))
+	if err != nil {
+		fsys.logerror("disk_write", slog.String("err", err.Error()))
+		return drError
+	}
+	return drOK
+}
+func (fsys *FS) disk_read(dst []byte, sector lba, numsectors int) diskresult {
+	fsys.trace("fs:disk_read", slog.Uint64("start", uint64(sector)), slog.Int("numsectors", numsectors))
+	off := fsys.blk.off(int64(len(dst)))
+	blocks := fsys.blk._divideBlockSize(int64(len(dst)))
+	if off != 0 || blocks != int64(numsectors) {
+		fsys.logerror("disk_read:unaligned")
+		return drParError
+	}
+	_, err := fsys.device.ReadBlocks(dst, int64(sector))
+	if err != nil {
+		fsys.logerror("disk_read", slog.String("err", err.Error()))
+		return drError
+	}
+	return drOK
+}
+func (fsys *FS) disk_erase(startSector lba, numSectors int) diskresult {
+	fsys.trace("fs:disk_erase", slog.Uint64("start", uint64(startSector)), slog.Int("numsectors", numSectors))
+	err := fsys.device.EraseBlocks(int64(startSector), int64(numSectors))
+	if err != nil {
+		fsys.logerror("disk_erase", slog.String("err", err.Error()))
+		return drError
+	}
+	return drOK
+}
+
+func (fsys *FS) dbc_1st(c byte) bool {
+	// fsys.trace("fs:dcb_1st")
+	if c >= fsys.dbcTbl[0] {
+		return c <= fsys.dbcTbl[1] || (c >= fsys.dbcTbl[2] && c <= fsys.dbcTbl[3])
+	}
+	return false
+	// TODO(soypat): Revise code page effect here.
+	// return (fsys.ffCodePage == 0 || fsys.ffCodePage >= 900) &&
+	// 	(c >= fsys.dbcTbl[0] || (c >= fsys.dbcTbl[2] && c <= fsys.dbcTbl[3]))
+}
+
+func (fsys *FS) dbc_2nd(c byte) bool {
+	// fsys.trace("fs:dcb_2nd")
+	dbc := &fsys.dbcTbl
+	if c >= dbc[4] {
+		return c <= dbc[5] || (c >= dbc[6] && c <= dbc[7]) ||
+			(c >= dbc[8] && c <= dbc[9])
+	}
+	return false
+	// TODO(soypat): Revise code page effect here.
+	// return (fsys.ffCodePage == 0 || fsys.ffCodePage >= 900) &&
+	// 	(c >= fsys.dbcTbl[4] || (c >= fsys.dbcTbl[6] && c <= fsys.dbcTbl[7]) ||
+	// 		(c >= fsys.dbcTbl[8] && c <= fsys.dbcTbl[9]))
+}
+
+func (fsys *FS) window_clr() {
+	fsys.win = [len(fsys.win)]byte{} // Effectively a memclear.
+}
+
+func chk_chr(str *byte, char byte) bool {
+	for *str != 0 && *str != char {
+		str = (*byte)(unsafe.Add(unsafe.Pointer(str), 1))
+	}
+	return *str != 0
+}
+
+// Sector size divide and modulus. Can each be optimized further on to be a single bitwise instruction.
+
+func (fsys *FS) divSS(n uint32) uint32 { return n / uint32(fsys.ssize) }
+func (fsys *FS) modSS(n uint32) uint32 { return n % uint32(fsys.ssize) }
+
+// clst2sect returns the physical sector number from a cluster number.
+// Returns 0 if the cluster is invalid.
+func (fsys *FS) clst2sect(clst uint32) lba {
+	clst -= 2
+	if clst >= fsys.n_fatent-2 {
+		return 0
+	}
+	return fsys.database + lba(fsys.csize)*lba(clst)
+}
+
+const slogLevelTrace = slog.LevelDebug - 2
+
+func (fsys *FS) logattrs(level slog.Level, msg string, attrs ...slog.Attr) {
+	if fsys.log != nil {
+		fsys.log.LogAttrs(context.Background(), level, msg, attrs...)
+	}
+}
+
+func (fsys *FS) trace(msg string, attrs ...slog.Attr) {
+	fsys.logattrs(slogLevelTrace, msg, attrs...)
+}
+func (fsys *FS) debug(msg string, attrs ...slog.Attr) {
+	fsys.logattrs(slog.LevelDebug, msg, attrs...)
+}
+func (fsys *FS) info(msg string, attrs ...slog.Attr) {
+	fsys.logattrs(slog.LevelInfo, msg, attrs...)
+}
+func (fsys *FS) warn(msg string, attrs ...slog.Attr) {
+	fsys.logattrs(slog.LevelWarn, msg, attrs...)
+}
+func (fsys *FS) logerror(msg string, attrs ...slog.Attr) {
+	fsys.logattrs(slog.LevelError, msg, attrs...)
+}
+
+// register registers the object to the directory. Returns:
+//   - frOK: successful
+//   - frDenied:no free entry or too many SFN collisions
+//   - frDiskErr: disk error
+func (dp *dir) register() (fr fileResult) {
+	const maxCollisions = 100
+	fsys := dp.obj.fs
+	fsys.trace("dir:register")
+	if dp.fn[nsFLAG]&(nsDOT|nsNONAME) != 0 {
+		return frInvalidName
+	}
+	ln := fsys.lfnlen()
+	if fsys.isExfat() {
+		return dp.register_exfat()
+	}
+	var sn [12]byte
+	copy(sn[:], dp.fn[:])
+	if sn[nsFLAG]&nsLOSS != 0 {
+		// LFN is out of 8.3 format; generate numbered name.
+		dp.fn[nsFLAG] = nsNOLFN
+		n := uint32(1)
+		for ; n < maxCollisions; n++ {
+			fsys.gen_numname(dp.fn[:], sn[:], fsys.lfnbuf[:], n)
+			fr = dp.find()
+			if fr != frOK {
+				break
+			}
+		}
+		if n == maxCollisions {
+			return frDenied // Abort: too many collisions.
+		} else if fr != frNoFile {
+			return fr // Probably disk error, we want NoFile result that indicates no collision.
+		}
+		dp.fn[nsFLAG] = sn[nsFLAG]
+	}
+
+	// Create an SFN with/without LFNs
+	nent := 1
+	if sn[nsFLAG]&nsLFN != 0 {
+		nent = (ln+12)/13 + 1
+	}
+	fr = dp.alloc(nent)
+	nent--
+	if fr == frOK && nent != 0 {
+		// Set LFN entry if needed.
+		fr = dp.sdi(dp.dptr - uint32(nent*sizeDirEntry))
+		if fr == frOK {
+			sum := sum_sfn(dp.fn[:])
+			for {
+				// Store LFN entries in bottom first.
+				fr = fsys.move_window(dp.sect)
+				if fr != frOK {
+					break
+				}
+				fsys.put_lfn(dp.dir[:], byte(nent), sum)
+				fsys.wflag = 1
+				const stretchTable = false
+				fr = dp.next(stretchTable)
+				nent--
+				if fr != frOK || nent <= 0 {
+					break
+				}
+			}
+		}
+	}
+	if fr == frOK {
+		fr = fsys.move_window(dp.sect)
+		if fr == frOK {
+			dp.dirbuf_clr()
+			copy(dp.dir[dirNameOff:], dp.fn[:11])
+			dp.dir[dirNTresOff] = dp.fn[nsFLAG] & (nsBODY | nsEXT)
+			fsys.wflag = 1
+		}
+	}
+	return fr
+
+}
+
+// alloc reserves a block of directory entries. Returns:
+//   - frOK: successful
+//   - frDenied: could not stretch the directory table or no free entry
+//   - frDiskErr: disk error
+func (dp *dir) alloc(nent int) (fr fileResult) {
+	fsys := dp.obj.fs
+	fsys.trace("dir:alloc")
+	fr = dp.sdi(0)
+	n := 0
+	for fr == frOK {
+		fr = fsys.move_window(dp.sect)
+		if fr != frOK {
+			break
+		}
+		isEx := fsys.fstype == FormatExFAT
+		dname := dp.dir[dirNameOff]
+		if (!isEx && (dname == mskDDEM || dname == 0)) || (isEx && dp.dir[xdirType]&0x80 == 0) {
+			// Entry is free.
+			n++
+			if n == nent {
+				break // Block of contiguous free entries is found.
+			}
+		} else {
+			n = 0
+		}
+		const enableStretching = true
+		fr = dp.next(enableStretching)
+	}
+
+	if fr == frNoFile {
+		fr = frDenied
+	}
+	return fr
+}
+
+// follow_path traverses the directory tree
+func (dp *dir) follow_path(path string) (fr fileResult) {
+	fsys := dp.obj.fs
+	fsys.trace("dir:follow_path", slog.String("path", path))
+	path = trimSeparatorPrefix(path)
+	dp.obj.sclust = 0 // Set start directory (always root dir)
+
+	dp.obj.n_frag = 0 // Invalidate last fragment counter.
+	if fsys.fstype == _FormatUnknown {
+		return frNoFilesystem // Not mounted.
+	}
+	if len(path) == 0 || isTermLFN(path[0]) {
+		// Received origin directory.
+		dp.fn[nsFLAG] = nsNONAME
+		return dp.sdi(0)
+	}
+
+	for {
+		path, fr = dp.create_name(path)
+		if fr != frOK {
+			break
+		}
+		fr = dp.find()
+		ns := dp.fn[nsFLAG]
+		if fr != frOK {
+			if fr == frNoFile && ns&nsLAST == 0 {
+				// Could not find the object.
+				fr = frNoPath
+			}
+			break
+		}
+		if ns&nsLAST != 0 {
+			// Last segment match. Function completed.
+			break
+		}
+		// Get into the sub directory.
+		if dp.obj.attr&amDIR == 0 {
+			// Cannot follow because it is a file.
+			fr = frNoPath
+			break
+		}
+		// Open next directory:
+		if fsys.isExfat() {
+			dp.obj.init_alloc_info_sdir(dp)
+		} else {
+			off := fsys.modSS(dp.dptr)
+			dp.obj.sclust = fsys.ld_clust(fsys.win[off:])
+		}
+	}
+	return fr
+}
+
+func (dp *dir) dirbuf_clr() {
+	for i := 0; i < sizeDirEntry; i++ {
+		dp.dir[i] = 0
+	}
+}
+
+// find searches the directory for an object matching the given name. Returns:
+//   - frOK: successful
+//   - frNoFile: no file found
+//   - frDiskErr: disk error
+func (dp *dir) find() fileResult {
+	fsys := dp.obj.fs
+	fsys.trace("dir:find")
+	fr := dp.sdi(0) // Rewind directory object.
+	if fr != frOK {
+		return fr
+	}
+	if exfatEnabled && fsys.fstype == FormatExFAT {
+		return dp.find_exfat()
+	}
+	var ord, sum byte = 0xff, 0xff
+	dp.blk_ofs = badLBA // Reset LFN sequence.
+	for fr == frOK {
+		fr = fsys.move_window(dp.sect)
+		if fr != frOK {
+			break
+		}
+		c := dp.dir[dirNameOff]
+		if c == 0 {
+			// Reached to end of table.
+			fr = frNoFile
+			break
+		}
+		// LFN LOGIC START.
+		attr := dp.dir[dirAttrOff] & amMASK
+		dp.obj.attr = attr
+		if c == mskDDEM || (attr&amVOL != 0 && attr != amLFN) {
+			ord = 0xff
+			dp.blk_ofs = badLBA // Reset LFN sequence.
+		} else {
+			if attr == amLFN {
+				if dp.fn[nsFLAG]&nsNOLFN == 0 {
+					if c&mskLLEF != 0 {
+						// Start of LFN sequence.
+						sum = dp.dir[ldirChksumOff]
+						c &^= mskLLEF
+						ord = c
+						dp.blk_ofs = dp.dptr
+					}
+					if c == ord && sum == dp.dir[ldirChksumOff] && fsys.cmp_lfn(dp.dir[:]) {
+						ord--
+					} else {
+						ord = 0xff
+					}
+				}
+			} else {
+				if ord == 0 && sum == sum_sfn(dp.dir[:]) {
+					break // LFN matches.
+				} else if dp.fn[nsFLAG]&nsLOSS == 0 && !memcmp(&dp.dir[0], &dp.fn[0], 11) {
+					break // SFN matches.
+				}
+				// Reset LFN sequence.
+				ord = 0xff
+				dp.blk_ofs = badLBA
+			}
+		}
+		const stretchTable = false
+		fr = dp.next(stretchTable)
+	}
+	return fr
+}
+
+// next advances the directory table to the next entry. Returns:
+//   - frOK: successful
+//   - frNoFile: end of table
+//   - frDenied: could not stretch the directory table
+func (dp *dir) next(stretch bool) fileResult {
+	fsys := dp.obj.fs
+	fsys.trace("dir:next", slog.Bool("stretch", stretch))
+	ofs := dp.dptr + sizeDirEntry
+	if ofs >= maxDIREx || (ofs >= maxDIR && fsys.fstype != FormatExFAT) {
+		dp.sect = 0 // Disable if reached maximum offset.
+	}
+	if dp.sect == 0 {
+		return frNoFile
+	}
+	modOfs := fsys.modSS(ofs)
+	if modOfs != 0 {
+		// Sector unchanged.
+		goto AllOK
+	}
+	// Sector changed.
+	dp.sect++
+	if dp.clust == 0 {
+		// Static table.
+		if ofs/sizeDirEntry >= uint32(fsys.nrootdir) {
+			dp.sect = 0
+			return frNoFile // EOT: Reached end of static table.
+		}
+		goto AllOK
+	}
+
+	// Create a anonymous scope so goto does not jump over variable declarations.
+	{
+		// Dynamic table.
+		divOfs := fsys.divSS(ofs)
+		if divOfs&uint32(fsys.csize-1) != 0 {
+			goto AllOK // Cluster not changed.
+		}
+		clst := dp.obj.clusterstat(dp.clust)
+		if clst <= 1 {
+			return frIntErr
+		} else if clst == badCluster {
+			return frDiskErr
+		} else if clst >= fsys.n_fatent {
+			if !stretch {
+				// If no stretch report EOT.
+				dp.sect = 0
+				return frNoFile
+			}
+			// Stretch the directory table by allocating a cluster.
+			clst = dp.obj.create_chain(dp.clust)
+			switch clst {
+			case 0:
+				return frDenied
+			case 1:
+				return frIntErr
+			case badCluster:
+				return frDiskErr
+			}
+			// Try cleaning the stretched table.
+			if fsys.dir_clear(clst) != frOK {
+				return frDiskErr
+			}
+			dp.obj.stat |= 4 // ExFAT, mark directory as stretched.
+		}
+		dp.clust = clst // Next cluster.
+		dp.sect = fsys.clst2sect(clst)
+	}
+
+AllOK:
+	dp.dptr = ofs                   // Current entry.
+	dp.dir = dp.obj.fs.win[modOfs:] // Pointer to the entry in win[].
+	return frOK
+}
+
+func (dp *dir) sdi(ofs uint32) fileResult {
+	fsys := dp.obj.fs
+	fsys.trace("dir:sdi", slog.Uint64("ofs", uint64(ofs)))
+	switch {
+	case fsys.fstype == FormatExFAT && ofs >= maxDIREx:
+		return frIntErr
+	case ofs >= maxDIR:
+		return frIntErr
+	}
+	dp.dptr = ofs
+	clst := dp.obj.sclust
+	if clst == 0 {
+		if fsys.fstype >= FormatFAT32 {
+			clst = uint32(fsys.dirbase)
+			dp.obj.stat = 0 // exFAT: Root dir has a FAT chain.
+		}
+	}
+
+	if clst == 0 {
+		if ofs/sizeDirEntry >= uint32(fsys.nrootdir) {
+			return frIntErr
+		}
+		dp.sect = fsys.dirbase
+	} else {
+		// Bytes per cluster.
+		csz := uint32(fsys.csize) * uint32(fsys.ssize)
+		for ofs >= csz {
+			clst = dp.obj.clusterstat(clst)
+			if clst == badCluster {
+				return frDiskErr
+			} else if clst < 2 || clst >= fsys.n_fatent {
+				return frIntErr
+			}
+			ofs -= csz
+		}
+		dp.sect = fsys.clst2sect(clst)
+	}
+
+	dp.clust = clst
+	if dp.sect == 0 {
+		return frIntErr
+	}
+	dp.sect += lba(fsys.divSS(ofs))
+	dp.dir = fsys.win[fsys.modSS(ofs):]
+	return frOK
+}
+
+// create_chain stretches or creates a chain. Returns:
+//   - 0: No free cluster.
+//   - 1: Internal error.
+//   - 0xffff_ffff: Disk error.
+//   - >= 2: New cluster number.
+func (obj *objid) create_chain(clst uint32) uint32 {
+	fsys := obj.fs
+	fsys.trace("obj:create_chain", slog.Uint64("clst", uint64(clst)))
+	var cs, ncl, scl uint32
+	if clst == 0 {
+		// Request to create a new chain.
+		scl = fsys.last_clst
+		if scl == 0 || scl >= fsys.n_fatent {
+			scl = 1
+		}
+	} else {
+		// Stretch a chain.
+		cs = obj.clusterstat(clst)
+		if cs < 2 {
+			fsys.logerror("create_chain:insanity")
+			return 1
+		} else if cs == badCluster || cs < fsys.n_fatent {
+			// Disk error or it is already followed by next cluster.
+			return cs
+		}
+		// Suggested cluster to start to find free cluster.
+		scl = clst
+	}
+	if fsys.free_clst == 0 {
+		return 0 // No free cluster.
+	}
+	var fr fileResult
+	if fsys.isExfat() {
+		ncl, fr = obj.create_chain_exfat(clst, scl)
+		if ncl < 2 || ncl == badCluster {
+			return ncl // No free cluster or error status.
+		}
+	} else {
+		if scl == clst {
+			ncl = scl + 1
+			if ncl >= fsys.n_fatent {
+				ncl = 2
+			}
+			cs = obj.clusterstat(ncl)
+			if cs == 1 || cs == badCluster {
+				return cs // Return error as is.
+			}
+			if cs != 0 {
+				// Is not free. Start at suggested cluster.
+				cs = fsys.last_clst
+				if cs >= 2 && cs < fsys.n_fatent {
+					scl = cs
+				}
+				ncl = 0
+			}
+		}
+		if ncl == 0 {
+			// New cluster not contiguous, find another fragment.
+			ncl = scl
+			for {
+				ncl++
+				if ncl >= fsys.n_fatent {
+					ncl = 2
+					if ncl > scl {
+						return 0 // No free cluster.
+					}
+				}
+				cs = obj.clusterstat(ncl)
+				if cs == 0 {
+					break
+				} else if cs == 1 || cs == badCluster {
+					return cs // Return error as is.
+				} else if ncl == scl {
+					return 0 // No free cluster.
+				}
+			}
+		}
+		// Make new cluster EOC.
+		fr = fsys.put_clusterstat(ncl, badCluster)
+		if fr == frOK && clst != 0 {
+			// Link cluster to previous one if needed.
+			fr = fsys.put_clusterstat(clst, ncl)
+		}
+	}
+	if fr == frOK {
+		fsys.last_clst = ncl
+		if fsys.free_clst > 0 && fsys.free_clst <= fsys.n_fatent-2 {
+			fsys.free_clst--
+			fsys.fsi_flag |= 1
+		}
+	} else {
+		if fr == frDiskErr {
+			ncl = badCluster
+		} else {
+			ncl = 1
+		}
+	}
+	return ncl
+}
+
+// remove_chain removes a chain from cluster clst. pclst is the previous cluster of clst.
+// pclst is zero if the entire chain is to be removed. Returns:
+//   - frOK: successful
+//   - frDiskErr: disk error
+func (obj *objid) remove_chain(clst, pclst uint32) (res fileResult) {
+	fsys := obj.fs
+	fsys.trace("obj:remove_chain", slog.Uint64("clst", uint64(clst)), slog.Uint64("pclst", uint64(pclst)))
+	if clst < 2 || clst >= fsys.n_fatent {
+		return frIntErr // Invalid range.
+	}
+
+	if pclst != 0 && (!fsys.isExfat() || obj.stat != 2) {
+		// Mark previous cluster EOC on the FAT if exists.
+		res = fsys.put_clusterstat(pclst, badCluster)
+		if res != frOK {
+			return res
+		}
+	}
+
+	// Remove the chain.
+	ecl := clst
+	scl := clst
+	for {
+		nxt := obj.clusterstat(clst)
+		if nxt == 0 {
+			break // Empty cluster.
+		} else if nxt == 1 {
+			return frIntErr
+		} else if nxt == badCluster {
+			return frDiskErr
+		}
+		if fsys.fstype != FormatExFAT {
+			// Make cluster 'free' on the FAT.
+			res = fsys.put_clusterstat(clst, 0)
+			if res != frOK {
+				return res
+			}
+		}
+		if fsys.free_clst < fsys.n_fatent-2 {
+			// Update allocation information if it is valid.
+			fsys.free_clst++
+			fsys.fsi_flag |= 1
+		}
+		if ecl+1 == nxt {
+			// Next cluster is contiguous.
+			ecl = nxt
+		} else {
+			// End of contiguous cluster block.
+			if fsys.isExfat() {
+				// Mark the cluster block 'free' on the bitmap.
+				res = fsys.change_bitmap(scl, ecl-scl+1, false)
+				if res != frOK {
+					return res
+				}
+			}
+			scl = nxt
+			ecl = nxt
+		}
+		clst = nxt // Next cluster.
+		if clst >= fsys.n_fatent {
+			break // Repeat until the last link.
+		}
+	}
+
+	if fsys.isExfat() {
+		// Post-process the chain status.
+		return obj.remove_chain_exfat_post(pclst)
+	}
+	return frOK
+}
+
+// init_alloc_info_sdir saves the containing directory info from sdir into
+// obj and loads the object allocation info from the entry set in fsys.dirbuf.
+// Mirrors C init_alloc_info(obj, sdir) with a non-null sdir (exFAT only).
+func (obj *objid) init_alloc_info_sdir(sdir *dir) {
+	obj.c_scl = sdir.obj.sclust
+	obj.c_size = uint32(sdir.obj.objsize&0xFFFFFF00) | uint32(sdir.obj.stat)
+	obj.c_ofs = sdir.blk_ofs
+	obj.init_alloc_info()
+}
+
+// blkIdxer is a helper for calculating block indexes and offsets.
+type blkIdxer struct {
+	blockshift int64
+	blockmask  int64
+}
+
+func makeBlockIndexer(blockSize int) (blkIdxer, error) {
+	if blockSize <= 0 {
+		return blkIdxer{}, errors.New("blockSize must be positive and non-zero")
+	}
+	tz := bits.TrailingZeros(uint(blockSize))
+	if blockSize>>tz != 1 {
+		return blkIdxer{}, errors.New("blockSize must be a power of 2")
+	}
+	blk := blkIdxer{
+		blockshift: int64(tz),
+		blockmask:  (1 << tz) - 1,
+	}
+	return blk, nil
+}
+
+// size returns the size of a block in bytes.
+func (blk *blkIdxer) size() int64 {
+	return 1 << blk.blockshift
+}
+
+// off gets the offset of the byte at byteIdx from the start of its block.
+//
+//go:inline
+func (blk *blkIdxer) off(byteIdx int64) int64 {
+	return blk._moduloBlockSize(byteIdx)
+}
+
+// idx gets the block index that contains the byte at byteIdx.
+//
+//go:inline
+func (blk *blkIdxer) idx(byteIdx int64) int64 {
+	return blk._divideBlockSize(byteIdx)
+}
+
+// modulo and divide are defined in terms of bit operations for speed since
+// blockSize is a power of 2.
+
+//go:inline
+func (blk *blkIdxer) _moduloBlockSize(n int64) int64 { return n & blk.blockmask }
+
+//go:inline
+func (blk *blkIdxer) _divideBlockSize(n int64) int64 { return n >> blk.blockshift }
+
+type _integer interface {
+	~uint8 | ~uint16 | ~uint32 | ~int | ~uint
+}
+
+func b2i[T _integer](b bool) T {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func b2u8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func trimSeparatorPrefix(s string) string {
+	for len(s) > 0 && isSep(s[0]) {
+		s = s[1:]
+	}
+	return s
+}
+
+func trimChar(s string, char byte) string {
+	for len(s) > 0 && s[0] == char {
+		s = s[1:]
+	}
+	return s
+}
+
+func isUpper[T _integer](c T) bool   { return 'A' <= c && c <= 'Z' }
+func isLower[T _integer](c T) bool   { return 'a' <= c && c <= 'z' }
+func isDigit[T _integer](c T) bool   { return '0' <= c && c <= '9' }
+func isSep[T _integer](c T) bool     { return c == '/' || c == '\\' }
+func isTermLFN[T _integer](c T) bool { return c < ' ' }
+func isSurrogate(c uint16) bool      { return c >= 0xd800 && c <= 0xdfff }
+func isSurrogateH(c uint16) bool     { return c >= 0xd800 && c <= 0xdbff }
+func isSurrogateL(c uint16) bool     { return c >= 0xdc00 && c <= 0xdfff }
+
+// func isTermNoLFN(c byte) bool { return c < '!' }
+
+func sum_sfn(sfn []byte) (sum byte) {
+	for i := byte(0); i < 11; i++ {
+		sum = (sum >> 1) + (sum << 7) + sfn[i]
+	}
+	return sum
+}
+
+func memcmp(a, b *byte, n int) bool {
+	return unsafe.String(a, n) != unsafe.String(b, n)
+}
+
+func clipname(s []byte) []byte {
+	i := 0
+	for i < len(s) && isfatchar(s[i]) {
+		i++
+	}
+	return s[:i]
+}
+
+func bstr(s []byte) []byte {
+	i := 0
+	for i < len(s) && s[i] != 0 {
+		i++
+	}
+	return s[:i]
+}
+
+func str(s []byte) string {
+	var buf []byte
+	return string(append(buf, bstr(s)...))
+}
+
+func isfatchar(c byte) bool {
+	return c != ' ' && c != 0 && c < 0x7F
+}

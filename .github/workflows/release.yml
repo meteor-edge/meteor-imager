@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: make cross VERSION=${{ github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/*_*/
+
+  linux:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: binaries
+          path: dist
+      - name: Fetch appimagetool
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool" dist/*/meteor-imager
+      - name: Package
+        env:
+          APPIMAGETOOL: ${{ runner.temp }}/appimagetool
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          scripts/package-linux.sh ${{ github.ref_name }} amd64
+          scripts/package-linux.sh ${{ github.ref_name }} arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/release/*
+
+  macos:
+    needs: binaries
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: binaries
+          path: dist
+      - run: chmod +x dist/*/meteor-imager && scripts/package-macos.sh ${{ github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/release/*
+
+  windows:
+    needs: binaries
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: binaries
+          path: dist
+      - name: Portable zips
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          New-Item -ItemType Directory -Force dist/release | Out-Null
+          foreach ($arch in "amd64", "arm64") {
+            Copy-Item LICENSE, README.md "dist/windows_$arch/"
+            Compress-Archive -Path "dist/windows_$arch/*" -DestinationPath "dist/release/meteor-imager_${v}_windows_$arch.zip"
+          }
+      - name: Installer
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DVersion=$v" "/DSource=..\..\dist\windows_amd64" packaging\windows\meteor-imager.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Move-Item "dist/MeteorImager-$v-setup.exe" dist/release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/release/*
+
+  publish:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: release
+          pattern: "{linux,macos,windows}"
+          merge-multiple: true
+      - name: Checksums
+        run: cd release && sha256sum * > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" release/* \
+            --repo "${{ github.repository }}" --title "Meteor Imager ${{ github.ref_name }}" --generate-notes

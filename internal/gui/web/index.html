@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meteor Imager</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="/static/icon.png">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img class="logo" src="/static/icon.png" alt="" width="28" height="28"> Meteor Imager <span id="version" class="muted"></span></div>
+  <button id="quit" class="link" type="button">Quit</button>
+</header>
+
+<main>
+  <div id="banner" class="banner warn" hidden></div>
+
+  <ol class="steps" aria-label="Steps">
+    <li data-step="1" class="active">Image</li>
+    <li data-step="2">Settings</li>
+    <li data-step="3">Card</li>
+    <li data-step="4">Write</li>
+  </ol>
+
+  <!-- 1. Image -->
+  <section id="step-1" class="card">
+    <h1>Choose an OS image</h1>
+    <div class="tabs" role="tablist">
+      <button role="tab" id="tab-server" aria-selected="true" type="button">From MeteorCloud</button>
+      <button role="tab" id="tab-file" aria-selected="false" type="button">Local file</button>
+    </div>
+
+    <div id="pane-server">
+      <label for="server">MeteorCloud address</label>
+      <div class="row">
+        <input id="server" placeholder="fleet.example.com or 192.168.0.10:8000" autocomplete="url" spellcheck="false">
+        <button id="load-images" class="primary" type="button">Load images</button>
+      </div>
+      <label class="check small"><input type="checkbox" id="insecure"> Allow plain HTTP to a non-LAN server (development only)</label>
+      <p class="hint">No login needed: the server lists the images its admins marked “Show in Meteor Imager”.</p>
+      <div id="images" class="list" role="radiogroup" aria-label="OS images"></div>
+    </div>
+
+    <div id="pane-file" hidden>
+      <label for="file-path">Image file (.img, .img.xz, .gz or .zip)</label>
+      <div class="row">
+        <input id="file-path" placeholder="/path/to/raspios.img.xz" spellcheck="false">
+        <button id="browse" type="button">Browse…</button>
+      </div>
+    </div>
+
+    <div class="actions"><button id="next-1" class="primary" type="button" disabled>Next</button></div>
+  </section>
+
+  <!-- 2. Settings -->
+  <section id="step-2" class="card" hidden>
+    <h1>Card settings</h1>
+    <p class="hint">Written to the card’s boot partition. Nothing here is sent to the server or saved by Meteor Imager, except the non-secret fields if you tick “Remember”.</p>
+
+    <fieldset>
+      <legend><label class="check"><input type="checkbox" id="use-enroll" checked> Enroll in MeteorCloud on first boot</label></legend>
+      <div id="enroll-fields">
+        <label for="domain">MeteorCloud domain the Pi connects to</label>
+        <input id="domain" placeholder="fleet.example.com" spellcheck="false" autocomplete="off">
+        <label for="api-key">Enrollment key</label>
+        <div class="row">
+          <input id="api-key" type="password" placeholder="key_…" autocomplete="new-password" spellcheck="false">
+          <button type="button" class="reveal" data-for="api-key">Show</button>
+        </div>
+        <p class="hint">Create one in MeteorCloud under Devices → Enrollment keys.</p>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend><label class="check"><input type="checkbox" id="use-wifi" checked> Connect to Wi-Fi</label></legend>
+      <div id="wifi-fields">
+        <label for="ssid">Network name (SSID)</label>
+        <input id="ssid" autocomplete="off" spellcheck="false">
+        <label for="psk">Password</label>
+        <div class="row">
+          <input id="psk" type="password" autocomplete="new-password" spellcheck="false">
+          <button type="button" class="reveal" data-for="psk">Show</button>
+        </div>
+        <div class="grid2">
+          <div>
+            <label for="country">Country</label>
+            <input id="country" maxlength="2" placeholder="DE" autocomplete="off" class="upper">
+          </div>
+          <label class="check end"><input type="checkbox" id="hidden-ssid"> Hidden network</label>
+        </div>
+        <p class="hint warn-text">The Wi-Fi password is stored on the card’s boot partition. Anyone with the card can read it.</p>
+      </div>
+    </fieldset>
+
+    <details>
+      <summary>More options</summary>
+      <div class="grid2">
+        <div>
+          <label for="hostname">Hostname</label>
+          <input id="hostname" placeholder="raspberrypi" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label for="timezone">Timezone</label>
+          <input id="timezone" placeholder="Europe/Berlin" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" id="remember" checked> Remember domain, Wi-Fi name, country, hostname and timezone (never passwords or keys)</label>
+      <button id="forget" class="link" type="button">Forget saved settings</button>
+    </details>
+
+    <ul id="problems" class="problems" hidden></ul>
+    <div class="actions">
+      <button class="back" type="button" data-to="1">Back</button>
+      <button id="next-2" class="primary" type="button">Next</button>
+    </div>
+  </section>
+
+  <!-- 3. Card -->
+  <section id="step-3" class="card" hidden>
+    <h1>Choose the card</h1>
+    <div class="row between">
+      <label class="check small"><input type="checkbox" id="show-all"> Show non-removable disks</label>
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+    <div id="devices" class="list" role="radiogroup" aria-label="Cards"></div>
+    <div class="actions">
+      <button class="back" type="button" data-to="2">Back</button>
+      <button id="next-3" class="primary" type="button" disabled>Next</button>
+    </div>
+  </section>
+
+  <!-- 4. Write -->
+  <section id="step-4" class="card" hidden>
+    <h1>Write the card</h1>
+    <dl id="summary" class="summary"></dl>
+    <div class="danger">
+      <strong>Everything on this card will be erased:</strong>
+      <div id="erase-device" class="mono"></div>
+      <label class="check"><input type="checkbox" id="confirm"> I understand</label>
+    </div>
+    <details>
+      <summary>Advanced</summary>
+      <label class="check"><input type="checkbox" id="skip-verify"> Skip verification (faster, not recommended)</label>
+    </details>
+    <div class="actions">
+      <button class="back" type="button" data-to="3">Back</button>
+      <button id="write" class="primary danger-btn" type="button" disabled>Write</button>
+    </div>
+  </section>
+
+  <!-- Progress -->
+  <section id="progress" class="card" hidden>
+    <h1 id="progress-title">Writing…</h1>
+    <div class="mono muted" id="progress-device"></div>
+    <ol class="stages" id="stages"></ol>
+    <div class="bar"><div id="bar-fill"></div></div>
+    <div id="progress-label" class="muted"></div>
+    <ul id="messages" class="messages"></ul>
+    <div id="result"></div>
+    <div class="actions">
+      <button id="cancel" type="button">Cancel</button>
+      <button id="again" class="primary" type="button" hidden>Write another card</button>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
