@@ -114,6 +114,7 @@ func Run(ctx context.Context, req Request, emit func(Event)) (*flash.Report, err
 	}
 	rep, err := flash.Write(ctx, src, tgt, req.Device.SizeBytes, req.Profile, flash.Options{
 		SkipVerify: req.SkipVerify,
+		SyncEvery:  flash.DeviceSyncEvery,
 		Progress:   func(s flash.Stage, f float64) { emit(Event{Stage: string(s), Fraction: f}) },
 	})
 	if cerr := tgt.Close(); err == nil && cerr != nil {

@@ -227,3 +227,24 @@ func TestConfigureFile(t *testing.T) {
 		t.Error("overwrote an existing output file")
 	}
 }
+
+type countingDisk struct {
+	memDisk
+	syncs int
+}
+
+func (c *countingDisk) Sync() error { c.syncs++; return nil }
+
+func TestWriteSyncsPeriodically(t *testing.T) {
+	path, _ := testImage(t, false)
+	src, _ := diskimage.Open(path)
+	defer src.Close()
+	card := &countingDisk{memDisk: memDisk{data: make([]byte, 128<<20)}}
+	if _, err := Write(context.Background(), src, card, 0, nil, Options{SyncEvery: 8 << 20, SkipVerify: true}); err != nil {
+		t.Fatal(err)
+	}
+	// ~65 MiB image: one flush per 8 MiB, plus the two final ones.
+	if card.syncs < 8 {
+		t.Fatalf("syncs = %d", card.syncs)
+	}
+}

@@ -51,7 +51,13 @@ type Options struct {
 	Progress   Progress
 	// Inject tunes boot partition edits; tests pin the clock here.
 	Inject bootfs.Options
+	// SyncEvery flushes the target after this many bytes, so progress follows
+	// what reached the card rather than the OS write cache (0: only at the end).
+	SyncEvery int64
 }
+
+// DeviceSyncEvery is the flush interval for real cards.
+const DeviceSyncEvery = 64 << 20
 
 // Report is the outcome, with no secrets in it.
 type Report struct {
@@ -83,7 +89,7 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 	head := make([]byte, 0, headSize)
 	h := sha256.New()
 	buf := make([]byte, chunkSize)
-	var off int64
+	var off, unsynced int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -111,6 +117,13 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 					return nil, fmt.Errorf("write at byte %d: %w", off, err)
 				}
 				off += int64(len(chunk))
+				unsynced += int64(len(chunk))
+			}
+			if opt.SyncEvery > 0 && unsynced >= opt.SyncEvery {
+				if err := tgt.Sync(); err != nil {
+					return nil, fmt.Errorf("flush: %w", err)
+				}
+				unsynced = 0
 			}
 			progress(StageWrite, src.Progress())
 		}
