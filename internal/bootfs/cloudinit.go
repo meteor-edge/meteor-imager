@@ -11,19 +11,15 @@ import (
 	"github.com/meteor-edge/meteor-imager/internal/profile"
 )
 
-// FirstbootURL is MeteorCloud's first-boot installer, as referenced by
-// MeteorCloud's src/device-plane/agent/packaging/firstboot/cloud-init-user-data.yaml.
-// It reads METEOR_DOMAIN and METEOR_API_KEY from .meteorenv on the boot partition.
-const FirstbootURL = "https://raw.githubusercontent.com/meteor-edge/meteor-cloud/master/src/device-plane/agent/packaging/firstboot/install-meteorcli-firstboot.sh"
+// FirstrunCommand is the cloud-init runcmd entry. It runs FirstrunScript from the
+// boot partition, which sends MeteorCloud the token request and then deletes
+// itself and .meteorenv.
+const FirstrunCommand = "bash /boot/firmware/" + FirstrunFile
 
-// FirstbootInstallCommand runs the installer from cloud-init. Every interface
-// is optional, so cloud-init may get here before Wi-Fi has joined: the
-// download is retried for up to five minutes.
-const FirstbootInstallCommand = `for i in $(seq 1 30); do curl -fsSL ` + FirstbootURL +
-	` -o /run/meteor-firstboot.sh && exec bash /run/meteor-firstboot.sh --now; sleep 10; done; ` +
-	`echo "meteor-imager: could not download MeteorCloud first boot" >&2; exit 1`
-
-const firstbootMarker = "install-meteorcli-firstboot.sh"
+// legacyFirstbootMarker is in the runcmd entry older Meteor Imager versions
+// wrote (download MeteorCloud's first-boot installer). Rewriting such a card
+// replaces it with FirstrunCommand.
+const legacyFirstbootMarker = "install-meteorcli-firstboot.sh"
 
 // MergeUserData adds the profile's settings to an existing cloud-config, keeping
 // everything already there (an organization's golden image may carry its own).
@@ -48,8 +44,9 @@ func MergeUserData(existing []byte, p *profile.FlashProfile) ([]byte, error) {
 			}
 		}
 		runcmd := sequence(root, "runcmd")
-		if !sequenceContains(runcmd, firstbootMarker) {
-			runcmd.Content = append(runcmd.Content, literal(FirstbootInstallCommand))
+		removeContaining(runcmd, legacyFirstbootMarker)
+		if !sequenceContains(runcmd, FirstrunFile) {
+			runcmd.Content = append(runcmd.Content, literal(FirstrunCommand))
 		}
 	}
 	return encode(doc, "#cloud-config")
@@ -193,6 +190,18 @@ func sequenceContains(seq *yaml.Node, substr string) bool {
 		}
 	}
 	return false
+}
+
+// removeContaining drops scalar entries of seq that contain substr.
+func removeContaining(seq *yaml.Node, substr string) {
+	kept := seq.Content[:0]
+	for _, item := range seq.Content {
+		if item.Kind == yaml.ScalarNode && strings.Contains(item.Value, substr) {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	seq.Content = kept
 }
 
 func mappingOf(kv ...any) *yaml.Node {

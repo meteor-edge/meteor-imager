@@ -202,8 +202,11 @@ func TestInjectCloudInitImage(t *testing.T) {
 	if pkgs := ud["packages"].([]any); len(pkgs) != 2 {
 		t.Errorf("packages = %v", pkgs)
 	}
-	if cmds := ud["runcmd"].([]any); len(cmds) != 1 || cmds[0] != FirstbootInstallCommand {
+	if cmds := ud["runcmd"].([]any); len(cmds) != 1 || cmds[0] != FirstrunCommand {
 		t.Errorf("runcmd = %v", cmds)
+	}
+	if got := readBack(t, path, FirstrunFile); got != string(FirstrunScript) {
+		t.Errorf("%s on the card differs from the embedded script", FirstrunFile)
 	}
 	if !strings.Contains(userData, "This is the user-data configuration file") {
 		t.Error("comments from the stock file were dropped")
@@ -266,6 +269,44 @@ func TestInjectIsIdempotent(t *testing.T) {
 		t.Errorf("cmdline.txt = %q", got)
 	}
 	fsck(t, path)
+}
+
+func TestInjectReplacesLegacyFirstbootCommand(t *testing.T) {
+	legacy := stockUserData + "runcmd:\n  - echo keep-me\n  - 'for i in $(seq 1 30); do curl -fsSL https://raw.githubusercontent.com/meteor-edge/meteor-cloud/master/src/device-plane/agent/packaging/firstboot/install-meteorcli-firstboot.sh -o /run/meteor-firstboot.sh; done'\n"
+	path := syntheticDisk(t, map[string]string{UserDataFile: legacy, CmdlineFile: stockCmdline})
+	injectInto(t, path, fullProfile())
+	var ud map[string]any
+	if err := yaml.Unmarshal([]byte(readBack(t, path, UserDataFile)), &ud); err != nil {
+		t.Fatal(err)
+	}
+	cmds := ud["runcmd"].([]any)
+	if len(cmds) != 2 || cmds[0] != "echo keep-me" || cmds[1] != FirstrunCommand {
+		t.Errorf("runcmd = %v", cmds)
+	}
+	fsck(t, path)
+}
+
+func TestInjectWithoutEnrollmentWritesNoFirstrun(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData, CmdlineFile: stockCmdline})
+	p := fullProfile()
+	p.Enrollment = nil
+	injectInto(t, path, p)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	v, err := OpenBoot(readOnly{f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	if v.Exists(FirstrunFile) {
+		t.Errorf("%s written without enrollment", FirstrunFile)
+	}
+	if strings.Contains(readBack(t, path, UserDataFile), FirstrunFile) {
+		t.Error("runcmd added without enrollment")
+	}
 }
 
 func TestInjectHiddenNetworkAndEmptyUserData(t *testing.T) {
@@ -347,8 +388,11 @@ func TestInjectAboveCluster65535(t *testing.T) {
 	if got := readBack(t, path, MeteorEnvFile); !strings.Contains(got, "METEOR_API_KEY=key_abc123") {
 		t.Errorf(".meteorenv = %q", got)
 	}
-	if got := readBack(t, path, UserDataFile); !strings.Contains(got, "install-meteorcli-firstboot.sh") {
+	if got := readBack(t, path, UserDataFile); !strings.Contains(got, FirstrunCommand) {
 		t.Errorf("user-data = %q", got)
+	}
+	if got := readBack(t, path, FirstrunFile); got != string(FirstrunScript) {
+		t.Errorf("%s above cluster 65535 differs from the embedded script", FirstrunFile)
 	}
 	fsck(t, path)
 }
