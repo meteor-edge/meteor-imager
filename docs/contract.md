@@ -64,9 +64,33 @@ METEOR_DOMAIN=fleet.example.com
 METEOR_API_KEY=key_...
 ```
 
-`KEY=value` lines, no quoting, LF line endings. MeteorCloud first boot reads it from
-`/boot/firmware/.meteorenv` (see MeteorCloud's
+`KEY=value` lines, no quoting, LF line endings. `meteor-firstrun.sh` reads it (the file is
+parsed, never sourced) and deletes it once the token request is sent. MeteorCloud's own first-boot
+scripts in golden images read `/boot/firmware/.meteorenv` too (see MeteorCloud's
 `src/device-plane/agent/packaging/firstboot/`).
+
+### `meteor-firstrun.sh` (enrollment set, cloud-init images)
+
+Embedded in Meteor Imager (`internal/bootfs/firstrun.sh`). cloud-init runs it once, as root:
+
+1. Reads `.meteorenv` next to it. Stops (files kept) without `METEOR_DOMAIN` and a `key_…` key.
+2. Installs `meteorcli` if it is missing, from
+   `https://github.com/meteor-edge/meteor-cloud/releases/latest/download/install-meteorcli.sh --with-service`.
+   Retries for up to 10 minutes while the network comes up.
+3. `meteorcli config --domain … --api-key …`, then `meteorcli request-token --name <hostname> --wait 0`,
+   retried for up to 10 minutes.
+4. **Only once the request is sent** (a claim secret is in `/etc/meteorcli`): deletes
+   `meteor-firstrun.sh` and `.meteorenv` from the boot partition, enables and restarts
+   `meteorcli.service`.
+5. `meteorcli run` waits for the administrator to approve the request, then runs the agent. The wait
+   survives reboots, and an expired request is submitted again with the key `meteorcli` keeps in
+   `/etc/meteorcli/api-key` (root only). meteorcli releases without this wait get a transient
+   `meteorcli-claim.service` instead (not kept across a reboot).
+
+If no request could be sent, both files stay and the log says why. Fix `.meteorenv` and run
+`sudo bash /boot/firmware/meteor-firstrun.sh`. A run after the request was sent only removes the
+files and starts the service; it never sends a second request. Log: `/var/log/meteor-firstrun.log`
+and `/var/log/cloud-init-output.log`.
 
 ### `user-data` (cloud-init images)
 
@@ -81,13 +105,11 @@ manage_etc_hosts: true             # if hostname set
 timezone: "Europe/Berlin"          # if timezone set
 packages: [curl, ca-certificates]  # if enrollment set; merged without duplicates
 runcmd:                            # if enrollment set; added once
-  - 'for i in $(seq 1 30); do curl -fsSL <FirstbootURL> -o /run/meteor-firstboot.sh && exec bash /run/meteor-firstboot.sh --now; sleep 10; done; ...'
+  - bash /boot/firmware/meteor-firstrun.sh
 ```
 
-`FirstbootURL` is
-`https://raw.githubusercontent.com/meteor-edge/meteor-cloud/master/src/device-plane/agent/packaging/firstboot/install-meteorcli-firstboot.sh`,
-the same installer as MeteorCloud's `cloud-init-user-data.yaml`. The download is retried for up
-to five minutes because Wi-Fi may still be connecting when cloud-init runs it. Running Meteor
+A runcmd entry from older Meteor Imager versions (downloading `install-meteorcli-firstboot.sh`)
+is replaced. Running Meteor
 Imager twice on the same card does not duplicate entries.
 
 ### `network-config` (Wi-Fi set, cloud-init images)

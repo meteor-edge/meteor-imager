@@ -1,6 +1,8 @@
 package bootfs
 
 import (
+	_ "embed"
+
 	"crypto/pbkdf2"
 	"crypto/sha1"
 	"encoding/hex"
@@ -19,7 +21,14 @@ const (
 	NetworkConfigFile = "network-config"
 	CmdlineFile       = "cmdline.txt"
 	WPASupplicantFile = "wpa_supplicant.conf"
+	FirstrunFile      = "meteor-firstrun.sh"
 )
+
+// FirstrunScript asks MeteorCloud for a device token on first boot, then removes
+// itself and .meteorenv. cloud-init runs it (see FirstrunCommand).
+//
+//go:embed firstrun.sh
+var FirstrunScript []byte
 
 // Result says what was written, without any secret values.
 type Result struct {
@@ -91,6 +100,11 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 	userData, err := MergeUserData(existing, p)
 	if err != nil {
 		return nil, err
+	}
+	if p.Enrollment != nil {
+		if err := write(FirstrunFile, FirstrunScript); err != nil {
+			return nil, err
+		}
 	}
 	if err := write(UserDataFile, userData); err != nil {
 		return nil, err

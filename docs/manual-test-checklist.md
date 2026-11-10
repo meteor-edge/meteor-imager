@@ -75,7 +75,11 @@ Record the version, OS version, card reader and card for each run.
 
 ### First boot on a Pi
 
-- [ ] The Pi joins Wi-Fi, installs MeteorCloud first boot and shows up in MeteorCloud within a few minutes.
+- [ ] The Pi joins Wi-Fi and shows up in MeteorCloud as a pending enrollment within a few minutes.
+- [ ] Before approving: `/boot/firmware/meteor-firstrun.sh` and `/boot/firmware/.meteorenv` are gone,
+      and `journalctl -u meteorcli` says the request is waiting for approval.
+- [ ] Reboot before approving: `meteorcli.service` waits again (same request ID, no new request).
+- [ ] Approve: within ~10 s the device is online and `meteorcli status` shows the device ID.
 - [ ] The hostname and timezone are as set.
 - [ ] Rewriting the same card with different Wi-Fi works (new instance-id).
 - [ ] Hidden SSID: the Pi joins.

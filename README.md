@@ -44,8 +44,11 @@ Get the build for your system from [Releases](https://github.com/meteor-edge/met
 4. **Write.** Confirm, and Meteor Imager writes the image, reads it back to verify it, writes the
    settings to the boot partition and ejects the card.
 
-Put the card in the Pi and power it on. On first boot, cloud-init joins the Wi-Fi network and
-installs MeteorCloud first boot, and the device shows up in MeteorCloud.
+Put the card in the Pi and power it on. On first boot, cloud-init joins the Wi-Fi network and runs
+`meteor-firstrun.sh` from the boot partition. It installs `meteorcli` if it is missing and sends
+MeteorCloud a token request. Once the request is sent, it deletes itself and `.meteorenv` from the
+card. The device then shows up in MeteorCloud as a pending enrollment. Approve it there, and
+`meteorcli.service` (which keeps waiting across reboots) picks up the token and starts the agent.
 
 To write the next card, press **Write another card**. Your settings stay filled in until you quit.
 
@@ -97,8 +100,9 @@ Only the FAT boot partition is changed. The root filesystem is written exactly a
 
 | File | When | Contents |
 |---|---|---|
-| `.meteorenv` | Enrollment set | `METEOR_DOMAIN` and `METEOR_API_KEY` for MeteorCloud first boot |
-| `user-data` | cloud-init images | Merged into the existing file: first-boot install command, hostname, timezone |
+| `.meteorenv` | Enrollment set | `METEOR_DOMAIN` and `METEOR_API_KEY`. Deleted by `meteor-firstrun.sh` once the token request is sent |
+| `meteor-firstrun.sh` | Enrollment set, cloud-init images | Sends the token request, then deletes itself and `.meteorenv` |
+| `user-data` | cloud-init images | Merged into the existing file: runs `meteor-firstrun.sh`, hostname, timezone |
 | `network-config` | Wi-Fi set | netplan v2 Wi-Fi (same layout as Raspberry Pi Imager) |
 | `meta-data` | cloud-init images | New `instance-id`, so cloud-init runs again even on a reused card |
 | `cmdline.txt` | cloud-init images | `ds=nocloud;i=<instance-id>` appended |
@@ -118,7 +122,9 @@ first boot preinstalled in the image. The full format is in [docs/contract.md](d
   server and never saved. "Remember settings" saves only the server address, domain, Wi-Fi name,
   country, hostname and timezone, in a file only you can read.
 - **Anyone holding the card can read its Wi-Fi password and enrollment key** on the boot
-  partition. Give enrollment keys an expiry date, revoke them when the batch is done, and keep cards safe.
+  partition until the Pi's first boot sends the token request (the key file is deleted then; the
+  Wi-Fi settings stay). Give enrollment keys an expiry date, revoke them when the batch is done,
+  and keep cards safe. The key alone never joins a device: an administrator approves each request.
 - **HTTPS by default.** Without a scheme, `https://` is used. Plain HTTP is accepted only for LAN
   and dev addresses (private IPs, `localhost`, `*.local`), or with `--insecure-http`. Redirects
   from HTTPS to HTTP are refused.
