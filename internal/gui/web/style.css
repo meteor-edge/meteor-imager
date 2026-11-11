@@ -64,7 +64,7 @@ button.link { border: none; background: none; color: var(--accent); padding: 4px
 .muted { color: var(--muted); font-weight: 400; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
 .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-.actions .back { margin-right: auto; }
+.actions .back, .actions .left { margin-right: auto; }
 fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 4px 14px 12px; margin: 14px 0; }
 legend { padding: 0 6px; }
 legend label.check { margin: 0; font-weight: 600; }

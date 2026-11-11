@@ -103,6 +103,10 @@ Record the version, OS version, card reader and card for each run.
 - [ ] Both boot, grow the root filesystem to the card (`df -h /`), have different SSH host keys and
       `/etc/machine-id`, Docker works, and both appear in MeteorCloud as pending enrollments.
 - [ ] **Cancel** during a backup leaves no file.
+- [ ] **Write this backup to a card** opens Settings with the backup as the local file; writing it
+      with a user, Wi-Fi and enrollment key gives a card that boots and enrolls.
+- [ ] **Start over** after a write or a backup goes back to the image step with no image, card,
+      passwords or key; saved preferences are filled in again.
 
 ### Legacy image (no cloud-init)
 

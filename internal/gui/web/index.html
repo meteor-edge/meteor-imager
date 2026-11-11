@@ -57,6 +57,8 @@
         <input id="file-path" placeholder="/path/to/raspios.img.xz" spellcheck="false">
         <button id="browse" type="button">Browse…</button>
       </div>
+      <p class="hint">A backup made with <strong>Back up a card</strong> (<span class="mono">.img</span> or
+        <span class="mono">.img.gz</span>) works too. Your settings are applied to each card you write from it.</p>
     </div>
 
     <div class="actions"><button id="next-1" class="primary" type="button" disabled>Next</button></div>
@@ -228,7 +230,9 @@
     <ul id="messages" class="messages"></ul>
     <div id="result"></div>
     <div class="actions">
+      <button id="start-over" class="left" type="button" title="Clear the image, settings and card" hidden>Start over</button>
       <button id="cancel" type="button">Cancel</button>
+      <button id="write-backup" type="button" hidden>Write this backup to a card</button>
       <button id="again" class="primary" type="button" hidden>Write another card</button>
     </div>
   </section>

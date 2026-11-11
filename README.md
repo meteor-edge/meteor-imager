@@ -69,9 +69,14 @@ To write the next card, press **Write another card**. Your settings stay filled 
 3. Put the card in your computer, open **Back up a card**, pick the card and save
    `….img.gz`. With e2fsprogs installed the image is shrunk to the data on the card, so it fits
    smaller cards; each card grows it back on first boot.
-4. Upload the file in MeteorCloud as an OS image and tick **Show in Meteor Imager**.
-5. Write cards from it with your General and MeteorCloud settings. Each device boots with its own
+4. Write cards from it right away (**Write this backup to a card** when the backup finishes, or
+   **Local file** and pick the `.img.gz`), or share it: upload the file in MeteorCloud as an OS
+   image and tick **Show in Meteor Imager**.
+5. Your General and MeteorCloud settings are applied to each card. Each device boots with its own
    keys and IDs, and asks to be enrolled.
+
+When a card is done, **Write another card** keeps the image and settings; **Start over** clears
+them and goes back to choosing an image.
 
 ### Publishing images on MeteorCloud
 

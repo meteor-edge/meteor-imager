@@ -9,7 +9,7 @@ const state = {
   server: null, insecure: false, images: [], imageId: null,
   devices: [], device: null,
   step: 1,
-  backupDevices: [], backupDevice: null, backupDir: "",
+  backupDevices: [], backupDevice: null, backupDir: "", lastBackupPath: "",
   job: "write", // kind of the job the progress page shows
 };
 
@@ -360,6 +360,8 @@ function showProgress(kind) {
   $("result").replaceChildren();
   $("cancel").hidden = false;
   $("again").hidden = true;
+  $("start-over").hidden = true;
+  $("write-backup").hidden = true;
   $("again").textContent = kind === "backup" ? "Back up another card" : "Write another card";
   $("progress-title").textContent = kind === "backup" ? "Backing up…" : "Writing…";
   poll();
@@ -390,6 +392,7 @@ async function poll() {
   if (st.running) { setTimeout(poll, 500); return; }
   $("cancel").hidden = true;
   $("again").hidden = false;
+  $("start-over").hidden = false;
   if (st.error) {
     $("progress-title").textContent = kind === "backup" ? "Backup failed" : "Writing failed";
     $("result").replaceChildren(el("div", { class: "error" }, st.error));
@@ -405,16 +408,77 @@ async function poll() {
 }
 
 function renderBackupResult(r) {
+  state.lastBackupPath = r.path || "";
+  $("write-backup").hidden = !state.lastBackupPath;
   const lines = [
     el("p", { class: "success" }, "Backup saved. You can remove the card now."),
     el("dl", { class: "summary" },
       el("dt", {}, "File"), el("dd", { class: "mono" }, r.path),
       el("dt", {}, "Size"), el("dd", {}, `${fmtSize(r.file_bytes)} (image ${fmtSize(r.image_bytes)}${r.shrunk ? ", shrunk" : ""})`),
       el("dt", {}, "SHA-256"), el("dd", { class: "mono" }, r.sha256)),
-    el("p", { class: "muted" }, "Next: in MeteorCloud, open Artifacts, upload this file as an OS image and tick “Show in Meteor Imager”. Then write cards from it here."),
+    el("p", { class: "muted" }, "Next: write cards from it now with “Write this backup to a card”, or share it: in MeteorCloud, open Artifacts, upload this file as an OS image and tick “Show in Meteor Imager”."),
   ];
   for (const n of r.notes || []) lines.push(el("p", { class: "banner warn" }, n));
   $("result").replaceChildren(...lines);
+}
+
+// Write the backup that just finished: same flow as a local image file.
+function writeBackup() {
+  state.device = null;
+  $("file-path").value = state.lastBackupPath;
+  setSource("file");
+  state.step = 2;
+  setSettingsTab("general");
+  setMode("write");
+}
+
+// Back to step 1 with an empty form, as when the app starts (saved preferences included).
+async function startOver() {
+  let prefs = {};
+  try { prefs = (await api("GET", "/api/state")).prefs || {}; } catch (_) { /* keep the form empty */ }
+  document.querySelectorAll("#step-1 input, #step-2 input, #step-2 textarea, #step-3 input, #step-4 input").forEach((e) => {
+    if (e.type === "checkbox" || e.type === "radio") e.checked = e.defaultChecked;
+    else e.value = e.defaultValue;
+  });
+  document.querySelectorAll(".reveal").forEach((b) => { $(b.dataset.for).type = "password"; b.textContent = "Show"; });
+  $("server").value = state.server || prefs.server_url || "";
+  $("insecure").checked = state.insecure;
+  applyPrefs(prefs);
+  // Refilled from the server, like a fresh start.
+  $("domain").dataset.auto = $("domain").value ? "0" : "1";
+  syncSettingsFields();
+  showProblems([]);
+  setSettingsTab("general");
+  Object.assign(state, { imageId: null, device: null, devices: [], images: [] });
+  setSource("server");
+  if ($("server").value) loadImages();
+  else $("images").replaceChildren();
+  state.step = 1;
+  setMode("write");
+}
+
+// Non-secret saved preferences into the settings form.
+function applyPrefs(p) {
+  if (p.meteor_domain) $("domain").value = p.meteor_domain;
+  $("ssid").value = p.wifi_ssid || "";
+  $("hidden-ssid").checked = !!p.wifi_hidden;
+  $("country").value = p.wifi_country || guessCountry();
+  $("hostname").value = p.hostname || "";
+  $("timezone").value = p.timezone || "";
+  $("user-name").value = p.user_name || "";
+  $("use-user").checked = !!p.user_name;
+  $("use-ssh").checked = !!p.ssh_enabled;
+  $(p.ssh_enabled && !p.ssh_password_authentication ? "ssh-auth-key" : "ssh-auth-password").checked = true;
+  $("ssh-key").value = p.ssh_authorized_key || "";
+}
+
+// Show only the fields of the ticked sections.
+function syncSettingsFields() {
+  for (const [box, fields] of [["use-enroll", "enroll-fields"], ["use-wifi", "wifi-fields"],
+    ["use-user", "user-fields"], ["use-ssh", "ssh-fields"]]) {
+    $(fields).hidden = !$(box).checked;
+  }
+  $("ssh-key-optional").hidden = $("ssh-auth-key").checked;
 }
 
 // ---------- wiring ----------
@@ -428,17 +492,7 @@ async function init() {
   if (!st.can_write) { $("banner").hidden = false; $("banner").textContent = st.why_not; }
   const p = st.prefs || {};
   $("server").value = p.server_url || "";
-  $("domain").value = p.meteor_domain || "";
-  $("ssid").value = p.wifi_ssid || "";
-  $("hidden-ssid").checked = !!p.wifi_hidden;
-  $("country").value = p.wifi_country || guessCountry();
-  $("hostname").value = p.hostname || "";
-  $("timezone").value = p.timezone || "";
-  $("user-name").value = p.user_name || "";
-  $("use-user").checked = !!p.user_name;
-  $("use-ssh").checked = !!p.ssh_enabled;
-  $(p.ssh_enabled && !p.ssh_password_authentication ? "ssh-auth-key" : "ssh-auth-password").checked = true;
-  $("ssh-key").value = p.ssh_authorized_key || "";
+  applyPrefs(p);
   state.backupDir = st.backup_dir || "";
   $("backup-out").value = defaultBackupPath();
   if (!st.shrink_available) {
@@ -465,15 +519,10 @@ async function init() {
   $("next-1").onclick = () => showStep(2);
   $("domain").addEventListener("input", () => { $("domain").dataset.auto = "0"; });
 
-  const toggle = (box, fields) => { const f = () => { $(fields).hidden = !$(box).checked; }; $(box).onchange = f; f(); };
-  toggle("use-enroll", "enroll-fields");
-  toggle("use-wifi", "wifi-fields");
-  toggle("use-user", "user-fields");
-  toggle("use-ssh", "ssh-fields");
-  const keyOptional = () => { $("ssh-key-optional").hidden = $("ssh-auth-key").checked; };
-  $("ssh-auth-key").onchange = keyOptional;
-  $("ssh-auth-password").onchange = keyOptional;
-  keyOptional();
+  for (const id of ["use-enroll", "use-wifi", "use-user", "use-ssh", "ssh-auth-key", "ssh-auth-password"]) {
+    $(id).onchange = syncSettingsFields;
+  }
+  syncSettingsFields();
   $("tab-general").onclick = () => setSettingsTab("general");
   $("tab-meteor").onclick = () => setSettingsTab("meteor");
   $("mode-write").onclick = () => setMode("write");
@@ -517,6 +566,8 @@ async function init() {
     state.device = null;
     showStep(3);
   };
+  $("write-backup").onclick = writeBackup;
+  $("start-over").onclick = startOver;
   $("quit").onclick = async () => {
     try { await api("POST", "/api/quit", {}); document.body.replaceChildren(el("main", {}, el("p", {}, "Meteor Imager has quit. You can close this tab."))); }
     catch (e) { alert(e.message); }
