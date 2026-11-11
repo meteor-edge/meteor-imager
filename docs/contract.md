@@ -4,11 +4,11 @@ This document is the interface between Meteor Imager, MeteorCloud and the Raspbe
 boot. It covers three things: the FlashProfile settings format, the files written to the card's
 boot partition, and the MeteorCloud API the imager calls.
 
-## 1. FlashProfile (JSON, `schema_version: 2`)
+## 1. FlashProfile (JSON, `schema_version: 3`)
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "wifi": {
     "ssid": "MyNetwork",
     "psk": "wifi-password",
@@ -20,7 +20,13 @@ boot partition, and the MeteorCloud API the imager calls.
     "meteor_api_key": "key_...",
     "device_name": "Lab Pi 01"
   },
+  "user": {
+    "name": "pi",
+    "password": "login-password"
+  },
   "ssh": {
+    "enabled": true,
+    "password_authentication": false,
     "authorized_keys": ["ssh-ed25519 AAAA... you@laptop"]
   },
   "hostname": "pi-01",
@@ -30,7 +36,7 @@ boot partition, and the MeteorCloud API the imager calls.
 
 | Field | Required | Rules |
 |---|---|---|
-| `schema_version` | yes | `2` (version `1` files still load; they cannot use `device_name` or `ssh`). A newer version is rejected with "update Meteor Imager". |
+| `schema_version` | yes | `3`. Versions `1` and `2` still load; they cannot use the fields marked v2/v3. A newer version is rejected with "update Meteor Imager". |
 | `wifi` | no | Omit for wired-only devices. |
 | `wifi.ssid` | with `wifi` | 1–32 bytes. |
 | `wifi.psk` | with `wifi` | 8–63 characters (WPA2/WPA3 personal). No line breaks. |
@@ -42,21 +48,39 @@ boot partition, and the MeteorCloud API the imager calls.
 | `hostname` | no | `null` or 1–63 characters: `a-z`, `0-9`, `-`. |
 | `timezone` | no | `null` or an IANA name. |
 | `enrollment.device_name` | no | v2. Name the device asks for in MeteorCloud, 1–63 characters, no line breaks. Default: the hostname. |
-| `ssh.authorized_keys` | no | v2. One OpenSSH public key for the image's login user. Applied by Meteor base images only. |
-| `ssh.user` | no | v2. User that gets the key. Default: the image's first login user. |
-| `ssh.enabled` | no | Reserved; must be absent. |
-| `extras` | no | Reserved; must be absent or empty in v1. |
+| `user.name` | with `user` | v3. Login user, as in Raspberry Pi Imager: the image's first user (uid 1000) is renamed to it, or it is created with sudo. Linux user name, not `root`. |
+| `user.password` | no | v3. Plain text in the profile; written to the card **only** as a SHA-512 crypt hash (`$6$…`). Empty keeps the image's password. At most 256 characters, no line breaks. |
+| `ssh.enabled` | no | v3. `true` turns the SSH server on, `false` off; absent keeps the image's setting. A key alone also turns SSH on. |
+| `ssh.password_authentication` | no | v3. `true` allows SSH password logins, `false` allows keys only; absent keeps the image's setting. |
+| `ssh.authorized_keys` | no | v2. One OpenSSH public key. |
+| `ssh.user` | no | v2. User that gets the key. Default: `user.name`, else the image's first login user. |
+| `extras` | no | Reserved; must be absent or empty. |
 
-Unknown fields are rejected, so a typo never silently does nothing. At least one of `wifi`,
-`enrollment`, `hostname` or `timezone` must be set.
+Unknown fields are rejected, so a typo never silently does nothing. At least one setting must be set.
 
-**Secrets.** `wifi.psk` and `enrollment.meteor_api_key` are only held in memory, or in a profile
-file you create yourself. Meteor Imager never writes them anywhere except the card, and never
-logs them. Validation errors name the field, never its value.
+**Secrets.** `wifi.psk`, `enrollment.meteor_api_key` and `user.password` are only held in memory,
+or in a profile file you create yourself. Meteor Imager never writes them anywhere except the card
+(the user password only as a hash), and never logs them. Validation errors name the field, never
+its value.
 
 **Saved preferences.** The desktop UI can remember non-secret fields only, in
 `<user config dir>/meteor-imager/prefs.json` with mode 0600: server address, domain, SSID, hidden
-flag, country, hostname and timezone.
+flag, country, hostname, timezone, user name, SSH on/off, password login and SSH public key.
+
+**Desktop UI.** The settings step has two tabs: **General** (hostname, timezone, user and password,
+Wi-Fi, SSH), like Raspberry Pi Imager's OS customisation, and **MeteorCloud** (domain, enrollment
+key, device name) for registering the device.
+
+### Which settings apply on which image
+
+| Setting | Meteor base image | cloud-init image | Image without cloud-init |
+|---|---|---|---|
+| Wi-Fi | yes | yes | yes (`wpa_supplicant.conf`) |
+| Hostname, timezone | yes | yes | no (warning) |
+| User and password | yes | yes | yes, password required (`userconf.txt`) |
+| SSH on | yes | yes | yes (`ssh` file) |
+| SSH off, keys only, SSH key | yes | yes | no (warning) |
+| Enrollment | yes | yes (`meteor-firstrun.sh`) | only if MeteorCloud first boot is installed |
 
 ## 2. Boot partition files
 
@@ -72,9 +96,11 @@ Base images with MeteorCloud first boot preinstalled (meteor-cloud's
 `install-meteorcli-firstboot.sh`) carry `.meteor-settings` on the config partition. For them,
 Meteor Imager writes **only** `.meteorenv` (version 2, below) and leaves `user-data`,
 `network-config`, `meta-data` and `cmdline.txt` alone. The image's `meteorcli-settings.service`
-applies everything early in boot (Wi-Fi through NetworkManager, hostname, timezone, SSH key),
+applies everything early in boot (Wi-Fi through NetworkManager, hostname, timezone, user, SSH),
 moves the enrollment values to `/etc/meteorcli-firstboot.env` (root only) and deletes `.meteorenv`
 from the card before the network starts. `meteorcli-firstboot.service` then sends one token request.
+Images made with meteor-cloud's `meteorcli-prepare-image.sh` (see [Golden images](#4-golden-images-back-up-a-prepared-card))
+are base images.
 
 ```
 METEOR_ENV_VERSION=2
@@ -87,6 +113,10 @@ METEOR_WIFI_SSID=MyNetwork
 METEOR_WIFI_PSK=wifi-password
 METEOR_WIFI_COUNTRY=DE
 METEOR_WIFI_HIDDEN=false
+METEOR_USER=pi
+METEOR_USER_PASSWORD_HASH=$6$<salt>$<hash>
+METEOR_SSH_ENABLED=true
+METEOR_SSH_PASSWORD_AUTH=false
 METEOR_SSH_AUTHORIZED_KEY=ssh-ed25519 AAAA... you@laptop
 METEOR_SSH_USER=pi
 ```
@@ -141,9 +171,20 @@ manage_resolv_conf: false          # added if absent
 hostname: "pi-01"                  # if hostname set
 manage_etc_hosts: true             # if hostname set
 timezone: "Europe/Berlin"          # if timezone set
+users:                             # if user set; an entry with the same name is replaced
+  - name: "pi"
+    groups: "users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo"
+    shell: "/bin/bash"
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: false             # if a password is set
+    passwd: "$6$<salt>$<hash>"     # SHA-512 crypt, never the password
+    ssh_authorized_keys: ["ssh-ed25519 AAAA..."]   # if the key is for this user
+ssh_authorized_keys: [...]         # key without a user: cloud-init's default user
+ssh_pwauth: false                  # if ssh.password_authentication set
 packages: [curl, ca-certificates]  # if enrollment set; merged without duplicates
-runcmd:                            # if enrollment set; added once
-  - bash /boot/firmware/meteor-firstrun.sh
+runcmd:
+  - systemctl enable --now ssh     # if SSH turned on (disable --now when off)
+  - bash /boot/firmware/meteor-firstrun.sh   # if enrollment set
 ```
 
 A runcmd entry from older Meteor Imager versions (downloading `install-meteorcli-firstboot.sh`)
@@ -199,6 +240,10 @@ network={
 Hostname and timezone need cloud-init and are skipped on these images, with a warning. Enrollment
 writes `.meteorenv`, with a warning that MeteorCloud first boot must already be installed in the image.
 
+A user is written as `userconf.txt` (`name:$6$…`, one line), which Raspberry Pi OS applies on first
+boot by renaming its first user; it needs a password. SSH on writes an empty `ssh` file. SSH keys,
+keys-only logins and SSH off cannot be set on these images and give a warning.
+
 ## 3. MeteorCloud API (no login)
 
 Both endpoints are public, rate limited per IP (default 60 requests a minute;
@@ -248,3 +293,27 @@ returns `404` for unknown or unpublished images and `429` when rate limited.
 - Upload: `POST /api/v1/organizations/{org}/artifacts` with form field `published=true` (OS images only).
 - Change later: `PATCH /api/v1/organizations/{org}/artifacts/{id}` with `{"published": true|false}`.
   Needs `artifact.update` and is audited.
+
+## 4. Golden images: back up a prepared card
+
+To publish an image with Docker, packages and `meteorcli` already installed:
+
+1. Write a plain OS (for example Raspberry Pi OS Lite Bookworm) with Meteor Imager or Raspberry Pi
+   Imager, boot it and install what every device needs (Docker, packages, `meteorcli`).
+2. On the device: `sudo meteorcli-prepare-image.sh` (meteor-cloud release asset). It installs
+   MeteorCloud first boot and the `.meteor-settings` marker, removes this device's identity
+   (meteorcli enrollment, `/etc/meteorcli`, Wi-Fi networks, SSH host keys, machine-id, cloud-init
+   state, history, logs), disables cloud-init and powers off.
+3. Back up the card: **Back up a card** in the UI, or
+   `meteor-imager backup --device /dev/sdX --out pi-golden.img.gz`.
+4. Upload the file to MeteorCloud as an `os_image` and publish it.
+5. Write cards from it with the General and MeteorCloud settings. Each card creates new SSH host
+   keys and a new machine-id, grows its root filesystem to the card, applies `.meteorenv` and sends
+   one token request.
+
+**Backup format.** The copy ends at the last partition. `.img.gz` is gzip-compressed, `.img` is raw;
+both can be written again by Meteor Imager. With e2fsprogs installed (`e2fsck`, `resize2fs`,
+`dumpe2fs`; Linux, or Homebrew on macOS) and an MBR card whose last partition is Linux (`83`), the
+root filesystem is shrunk on a temporary copy, never on the card, to its minimum plus 10% (at
+least 256 MiB), and the partition table entry is updated. The card is only read. The report gives
+the SHA-256 of the saved file.

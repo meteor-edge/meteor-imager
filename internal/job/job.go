@@ -1,5 +1,5 @@
 // Package job runs one end-to-end card write (download if needed, write,
-// verify, configure, eject) for both the CLI and the desktop UI.
+// verify, configure, eject) or card backup for both the CLI and the desktop UI.
 package job
 
 import (
@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/meteor-edge/meteor-imager/internal/backup"
 	"github.com/meteor-edge/meteor-imager/internal/devices"
 	"github.com/meteor-edge/meteor-imager/internal/diskimage"
 	"github.com/meteor-edge/meteor-imager/internal/flash"
@@ -66,6 +67,68 @@ func CheckDevice(d devices.Device, allowNonRemovable bool) error {
 		return fmt.Errorf("%s is not a removable disk; refusing to write it", d.Path)
 	}
 	return nil
+}
+
+// BackupRequest reads one card into an image file.
+type BackupRequest struct {
+	Device            devices.Device
+	Out               string // .img or .img.gz
+	Shrink            bool
+	AllowNonRemovable bool
+	NoEject           bool
+}
+
+// CheckBackupDevice refuses disks that must not be backed up from here.
+func CheckBackupDevice(d devices.Device, allowNonRemovable bool) error {
+	switch {
+	case d.System:
+		return fmt.Errorf("%s holds the running system; back up a card, not this computer's disk", d.Path)
+	case d.ReadOnly:
+		// The card is opened the same way as for writing, which a locked card refuses.
+		return fmt.Errorf("%s is read-only; slide the card's lock switch to unlock it (nothing is written)", d.Path)
+	case d.SizeBytes <= 0:
+		return fmt.Errorf("%s has no media; insert a card", d.Path)
+	case !d.Removable && !allowNonRemovable:
+		return fmt.Errorf("%s is not a removable disk; refusing to read it", d.Path)
+	}
+	return nil
+}
+
+// Backup copies a card to an image file. Nothing is written to the card.
+func Backup(ctx context.Context, req BackupRequest, emit func(Event)) (*backup.Report, error) {
+	if emit == nil {
+		emit = func(Event) {}
+	}
+	if err := CheckBackupDevice(req.Device, req.AllowNonRemovable); err != nil {
+		return nil, err
+	}
+	if err := backup.CheckOutput(req.Out); err != nil {
+		return nil, err
+	}
+	emit(Event{Stage: StageOpen, Message: req.Device.Describe()})
+	card, err := flash.OpenDevice(ctx, req.Device)
+	if err != nil {
+		return nil, err
+	}
+	rep, err := backup.Run(ctx, card, req.Device.SizeBytes, req.Out, backup.Options{
+		Shrink:   req.Shrink,
+		Progress: func(stage string, f float64, n int64) { emit(Event{Stage: stage, Fraction: f, Bytes: n}) },
+	})
+	if cerr := card.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("close %s: %w", req.Device.Path, cerr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !req.NoEject {
+		emit(Event{Stage: StageEject})
+		if err := flash.Eject(ctx, req.Device); err != nil {
+			emit(Event{Stage: StageEject, Fraction: 1, Message: "Could not eject automatically (" + err.Error() + "); eject the card before removing it."})
+			return rep, nil
+		}
+	}
+	emit(Event{Stage: StageEject, Fraction: 1})
+	return rep, nil
 }
 
 // Run performs the request. The profile's secrets are cleared when it returns.

@@ -16,14 +16,23 @@ import (
 // itself and .meteorenv.
 const FirstrunCommand = "bash /boot/firmware/" + FirstrunFile
 
+const (
+	sshEnableCommand  = "systemctl enable --now ssh"
+	sshDisableCommand = "systemctl disable --now ssh"
+)
+
 // legacyFirstbootMarker is in the runcmd entry older Meteor Imager versions
 // wrote (download MeteorCloud's first-boot installer). Rewriting such a card
 // replaces it with FirstrunCommand.
 const legacyFirstbootMarker = "install-meteorcli-firstboot.sh"
 
+// userGroups are the groups Raspberry Pi Imager gives the user it creates.
+const userGroups = "users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo"
+
 // MergeUserData adds the profile's settings to an existing cloud-config, keeping
 // everything already there (an organization's golden image may carry its own).
-func MergeUserData(existing []byte, p *profile.FlashProfile) ([]byte, error) {
+// The user password goes in only as passwordHash.
+func MergeUserData(existing []byte, p *profile.FlashProfile, passwordHash string) ([]byte, error) {
 	doc, root, err := parseMapping(existing, "user-data")
 	if err != nil {
 		return nil, err
@@ -35,6 +44,47 @@ func MergeUserData(existing []byte, p *profile.FlashProfile) ([]byte, error) {
 	}
 	if p.Timezone != nil {
 		set(root, "timezone", quoted(*p.Timezone))
+	}
+	key := p.SSHKey()
+	if u := p.User; u != nil {
+		entry := mappingOf(
+			"name", quoted(u.Name),
+			"groups", quoted(userGroups),
+			"shell", quoted("/bin/bash"),
+			"sudo", quoted("ALL=(ALL) NOPASSWD:ALL"),
+		)
+		if passwordHash != "" {
+			entry.Content = append(entry.Content,
+				plain("lock_passwd"), boolNode(false),
+				plain("passwd"), quoted(passwordHash))
+		}
+		if key != "" && p.SSHKeyUser() == u.Name {
+			entry.Content = append(entry.Content, plain("ssh_authorized_keys"),
+				&yaml.Node{Kind: yaml.SequenceNode, Content: []*yaml.Node{quoted(key)}})
+			key = ""
+		}
+		users := sequence(root, "users")
+		removeUser(users, u.Name)
+		users.Content = append(users.Content, entry)
+	}
+	if key != "" {
+		keys := sequence(root, "ssh_authorized_keys")
+		if !sequenceHas(keys, key) {
+			keys.Content = append(keys.Content, quoted(key))
+		}
+	}
+	if s := p.SSH; s != nil && s.PasswordAuthentication != nil {
+		set(root, "ssh_pwauth", boolNode(*s.PasswordAuthentication))
+	}
+	if on := p.SSHEnabled(); on != nil {
+		runcmd := sequence(root, "runcmd")
+		removeContaining(runcmd, sshEnableCommand)
+		removeContaining(runcmd, sshDisableCommand)
+		cmd := sshDisableCommand
+		if *on {
+			cmd = sshEnableCommand
+		}
+		runcmd.Content = append(runcmd.Content, literal(cmd))
 	}
 	if p.Enrollment != nil {
 		packages := sequence(root, "packages")
@@ -202,6 +252,21 @@ func removeContaining(seq *yaml.Node, substr string) {
 		kept = append(kept, item)
 	}
 	seq.Content = kept
+}
+
+// removeUser drops the users entry named name, so writing a card twice does not
+// declare the user twice.
+func removeUser(users *yaml.Node, name string) {
+	kept := users.Content[:0]
+	for _, item := range users.Content {
+		if item.Kind == yaml.MappingNode {
+			if n := find(item, "name"); n != nil && n.Value == name {
+				continue
+			}
+		}
+		kept = append(kept, item)
+	}
+	users.Content = kept
 }
 
 func mappingOf(kv ...any) *yaml.Node {

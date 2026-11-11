@@ -15,17 +15,18 @@ import (
 )
 
 // SchemaVersion is the FlashProfile JSON version this build writes. It also reads
-// version 1 (no device name, no SSH key).
-const SchemaVersion = 2
+// version 1 (no device name, no SSH key) and 2 (no user, SSH key only).
+const SchemaVersion = 3
 
 // FlashProfile is everything written to the boot partition. Secrets (Wi-Fi PSK,
-// enrollment API key) are only ever held in memory or in a file the operator
-// chose; Meteor Imager never stores them itself.
+// enrollment API key, user password) are only ever held in memory or in a file
+// the operator chose; Meteor Imager never stores them itself.
 type FlashProfile struct {
 	SchemaVersion int         `json:"schema_version"`
 	WiFi          *WiFi       `json:"wifi,omitempty"`
 	Enrollment    *Enrollment `json:"enrollment,omitempty"`
 	Hostname      *string     `json:"hostname"`
+	User          *User       `json:"user,omitempty"`
 	SSH           *SSH        `json:"ssh,omitempty"`
 	Timezone      *string     `json:"timezone"`
 	// Extras is reserved for settings added in later schema versions. v1 rejects
@@ -52,14 +53,26 @@ type Enrollment struct {
 	DeviceName string `json:"device_name,omitempty"`
 }
 
-// SSH adds a public key for the image's login user (v2). Only Meteor base images
-// (with MeteorCloud first boot) apply it.
+// User is the login user (v3). As in Raspberry Pi Imager, the image's first user
+// (uid 1000) is renamed to Name; images without one get a new user with sudo.
+type User struct {
+	Name string `json:"name"`
+	// Password is plain text here and reaches the card only as a SHA-512 crypt
+	// hash. Empty leaves the password unchanged (log in with an SSH key).
+	Password string `json:"password,omitempty"`
+}
+
+// SSH configures the SSH server (v3) and adds a public key (v2).
 type SSH struct {
-	// Enabled is reserved: set values are rejected so nothing is silently ignored.
+	// Enabled true turns SSH on, false turns it off; unset keeps the image's
+	// setting (a key alone also turns SSH on).
 	Enabled *bool `json:"enabled,omitempty"`
+	// PasswordAuthentication allows (true) or refuses (false) password logins;
+	// unset keeps the image's setting.
+	PasswordAuthentication *bool `json:"password_authentication,omitempty"`
 	// AuthorizedKeys holds one OpenSSH public key.
 	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
-	// User gets the key; empty means the image's first login user.
+	// User gets the key; empty means user.name, else the image's first login user.
 	User string `json:"user,omitempty"`
 }
 
@@ -96,8 +109,8 @@ func (p *FlashProfile) Validate() error {
 	if p.SchemaVersion < 1 || p.SchemaVersion > SchemaVersion {
 		add("schema_version must be 1 or %d", SchemaVersion)
 	}
-	if p.WiFi == nil && p.Enrollment == nil && p.Hostname == nil && p.Timezone == nil && p.SSHKey() == "" {
-		add("nothing to write: set wifi, enrollment, hostname, timezone or an SSH key")
+	if p.Empty() {
+		add("nothing to write: set wifi, enrollment, hostname, timezone, user or ssh")
 	}
 	if w := p.WiFi; w != nil {
 		if n := len(w.SSID); n == 0 || n > 32 {
@@ -141,12 +154,23 @@ func (p *FlashProfile) Validate() error {
 			add("timezone must be an IANA name such as Europe/Berlin")
 		}
 	}
+	if u := p.User; u != nil {
+		if p.SchemaVersion < 3 {
+			add("user needs schema_version 3")
+		}
+		if !userPattern.MatchString(u.Name) || u.Name == "root" {
+			add("user.name must be a Linux user name (lower-case letters, digits, - or _; not root)")
+		}
+		if len(u.Password) > 256 || strings.ContainsAny(u.Password, "\x00\r\n") {
+			add("user.password must be at most 256 characters, without line breaks")
+		}
+	}
 	if s := p.SSH; s != nil {
 		switch {
 		case p.SchemaVersion < 2 && (s.Enabled != nil || len(s.AuthorizedKeys) > 0 || s.User != ""):
 			add("ssh needs schema_version 2")
-		case s.Enabled != nil:
-			add("ssh.enabled is reserved; remove it (a key enables SSH)")
+		case p.SchemaVersion < 3 && (s.Enabled != nil || s.PasswordAuthentication != nil):
+			add("ssh.enabled and ssh.password_authentication need schema_version 3")
 		case len(s.AuthorizedKeys) > 1:
 			add("ssh.authorized_keys takes one key")
 		}
@@ -168,12 +192,50 @@ func (p *FlashProfile) Validate() error {
 	return nil
 }
 
+// Empty reports whether the profile would write nothing.
+func (p *FlashProfile) Empty() bool {
+	return p.WiFi == nil && p.Enrollment == nil && p.Hostname == nil && p.Timezone == nil &&
+		p.User == nil && !p.SSH.configured()
+}
+
+func (s *SSH) configured() bool {
+	return s != nil && (s.Enabled != nil || s.PasswordAuthentication != nil || len(s.AuthorizedKeys) > 0)
+}
+
 // SSHKey returns the SSH public key to install, or "".
 func (p *FlashProfile) SSHKey() string {
 	if p.SSH == nil || len(p.SSH.AuthorizedKeys) == 0 {
 		return ""
 	}
 	return p.SSH.AuthorizedKeys[0]
+}
+
+// SSHKeyUser is the user that gets the SSH key: ssh.user, else user.name, else
+// "" for the image's first login user.
+func (p *FlashProfile) SSHKeyUser() string {
+	if p.SSH != nil && p.SSH.User != "" {
+		return p.SSH.User
+	}
+	if p.User != nil {
+		return p.User.Name
+	}
+	return ""
+}
+
+// SSHEnabled is the SSH server state to set: a key alone turns SSH on; nil
+// leaves the image's setting.
+func (p *FlashProfile) SSHEnabled() *bool {
+	if p.SSH == nil {
+		return nil
+	}
+	if p.SSH.Enabled != nil {
+		return p.SSH.Enabled
+	}
+	if len(p.SSH.AuthorizedKeys) > 0 {
+		on := true
+		return &on
+	}
+	return nil
 }
 
 // ValidateDomain checks a METEOR_DOMAIN value: a host or host:port, no scheme or path.
@@ -217,6 +279,9 @@ func (p *FlashProfile) Clear() {
 	if p.Enrollment != nil {
 		p.Enrollment.MeteorAPIKey = ""
 	}
+	if p.User != nil {
+		p.User.Password = ""
+	}
 }
 
 // Redacted returns a copy safe to log or persist: secrets removed.
@@ -231,6 +296,11 @@ func (p *FlashProfile) Redacted() FlashProfile {
 		e := *p.Enrollment
 		e.MeteorAPIKey = ""
 		c.Enrollment = &e
+	}
+	if p.User != nil {
+		u := *p.User
+		u.Password = ""
+		c.User = &u
 	}
 	return c
 }

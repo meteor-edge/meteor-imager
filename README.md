@@ -36,9 +36,13 @@ Get the build for your system from [Releases](https://github.com/meteor-edge/met
 1. **Image.** Enter your MeteorCloud address (for example `fleet.example.com` or `192.168.0.10:8000`)
    and pick one of the OS images the server publishes. No login is needed. You can also pick a local
    `.img`, `.img.xz`, `.gz` or `.zip` file.
-2. **Settings.** Enter the MeteorCloud **domain** the Pi should connect to (filled in from the address),
-   an **enrollment key** (`key_…`, created in MeteorCloud under Devices → Enrollment keys), and the
-   **Wi-Fi** name, password and country. Hostname and timezone are optional.
+2. **Settings.** Two tabs:
+   - **General**, like Raspberry Pi Imager: hostname, timezone, **username and password** (the
+     image's first user is renamed; only a hash of the password goes on the card), **Wi-Fi** name,
+     password and country, and **SSH** (password login, or public key only with your key).
+   - **MeteorCloud**: the **domain** the Pi connects to (filled in from the address), an
+     **enrollment key** (`key_…`, created in MeteorCloud under Devices → Enrollment keys) and an
+     optional device name. Untick it to write a card that does not register itself.
 3. **Card.** Pick the SD card. Only removable disks are listed. Disks that hold the running system are
    never listed.
 4. **Write.** Confirm, and Meteor Imager writes the image, reads it back to verify it, writes the
@@ -51,6 +55,23 @@ card. The device then shows up in MeteorCloud as a pending enrollment. Approve i
 `meteorcli.service` (which keeps waiting across reboots) picks up the token and starts the agent.
 
 To write the next card, press **Write another card**. Your settings stay filled in until you quit.
+
+### Make your own image (Docker, packages, meteorcli preinstalled)
+
+1. Write a plain OS (for example Raspberry Pi OS Lite Bookworm), boot it and install what every
+   device needs: Docker, packages, `meteorcli`.
+2. On the device run meteor-cloud's prepare script. It installs MeteorCloud first boot, removes the
+   device's identity (enrollment, keys, Wi-Fi, SSH host keys, machine-id, logs) and powers off:
+   ```sh
+   curl -fsSLO https://github.com/meteor-edge/meteor-cloud/releases/latest/download/meteorcli-prepare-image.sh
+   sudo bash meteorcli-prepare-image.sh
+   ```
+3. Put the card in your computer, open **Back up a card**, pick the card and save
+   `….img.gz`. With e2fsprogs installed the image is shrunk to the data on the card, so it fits
+   smaller cards; each card grows it back on first boot.
+4. Upload the file in MeteorCloud as an OS image and tick **Show in Meteor Imager**.
+5. Write cards from it with your General and MeteorCloud settings. Each device boots with its own
+   keys and IDs, and asks to be enrolled.
 
 ### Publishing images on MeteorCloud
 
@@ -74,8 +95,15 @@ meteor-imager flash --server fleet.example.com --image "Raspberry Pi OS Lite" \
 meteor-imager profile > card.json      # example to edit
 meteor-imager flash --image raspios-lite.img.xz --device /dev/disk4 --profile card.json
 
+# User, password (METEOR_USER_PASSWORD or a prompt) and SSH with keys only.
+meteor-imager flash --image raspios-lite.img.xz --device /dev/sdb --user ops \
+  --ssh --ssh-password-auth false --ssh-key-file ~/.ssh/id_ed25519.pub
+
 # Configure an image file instead of a card (flash it later with any tool).
 meteor-imager configure --image raspios-lite.img.xz --out configured.img --profile card.json
+
+# Back up a card into a (shrunk, compressed) image file.
+meteor-imager backup --device /dev/sdb --out pi-golden.img.gz
 ```
 
 `flash` shows the card and asks you to type its name before it erases anything. `--yes` skips
@@ -89,6 +117,7 @@ that prompt, for scripts.
 | `list-devices` | Lists writable cards. `--all` also shows disks that cannot be written. |
 | `flash` | Writes, verifies, configures and ejects. |
 | `configure` | Writes a configured copy of an image to a new `.img` file. |
+| `backup` | Reads a card into `.img` or `.img.gz`, shrunk to its data when e2fsprogs is installed (`--no-shrink` to keep the size). |
 | `profile` | Prints an example FlashProfile. |
 
 Device paths: `/dev/sdX` or `/dev/mmcblkN` on Linux, `/dev/diskN` on macOS, and
@@ -99,9 +128,9 @@ Device paths: `/dev/sdX` or `/dev/mmcblkN` on Linux, `/dev/diskN` on macOS, and
 Only the FAT boot partition is changed. The root filesystem is written exactly as it is in the image.
 
 **Meteor base images** (MeteorCloud first boot preinstalled; they carry `.meteor-settings`) get a
-single `.meteorenv` with every setting: domain, key, device name, hostname, timezone, Wi-Fi and an
-optional SSH key. The image applies it before the network starts, deletes it from the card and
-sends one token request. A FAT partition labelled `METEORCFG` is used instead of the boot
+single `.meteorenv` with every setting: domain, key, device name, hostname, timezone, Wi-Fi, user
+(password as a hash) and SSH. The image applies it before the network starts, deletes it from the
+card and sends one token request. A FAT partition labelled `METEORCFG` is used instead of the boot
 partition when the image has one (Jetson, NUC and other device types).
 
 Stock Raspberry Pi OS images get the files below.
@@ -110,7 +139,8 @@ Stock Raspberry Pi OS images get the files below.
 |---|---|---|
 | `.meteorenv` | Enrollment set | `METEOR_DOMAIN` and `METEOR_API_KEY`. Deleted by `meteor-firstrun.sh` once the token request is sent |
 | `meteor-firstrun.sh` | Enrollment set, cloud-init images | Sends the token request, then deletes itself and `.meteorenv` |
-| `user-data` | cloud-init images | Merged into the existing file: runs `meteor-firstrun.sh`, hostname, timezone |
+| `user-data` | cloud-init images | Merged into the existing file: runs `meteor-firstrun.sh`, hostname, timezone, user (password hash), SSH |
+| `userconf.txt`, `ssh` | Images without cloud-init | User and password hash; SSH on |
 | `network-config` | Wi-Fi set | netplan v2 Wi-Fi (same layout as Raspberry Pi Imager) |
 | `meta-data` | cloud-init images | New `instance-id`, so cloud-init runs again even on a reused card |
 | `cmdline.txt` | cloud-init images | `ds=nocloud;i=<instance-id>` appended |

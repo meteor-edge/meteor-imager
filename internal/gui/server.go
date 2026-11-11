@@ -17,10 +17,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/meteor-edge/meteor-imager/internal/backup"
 	"github.com/meteor-edge/meteor-imager/internal/devices"
 	"github.com/meteor-edge/meteor-imager/internal/flash"
 	"github.com/meteor-edge/meteor-imager/internal/job"
@@ -97,15 +99,18 @@ type server struct {
 }
 
 type jobState struct {
-	Running  bool          `json:"running"`
-	Stage    string        `json:"stage,omitempty"`
-	Fraction float64       `json:"fraction"`
-	Bytes    int64         `json:"bytes,omitempty"`
-	Messages []string      `json:"messages,omitempty"`
-	Error    string        `json:"error,omitempty"`
-	Problems []string      `json:"problems,omitempty"`
-	Report   *flash.Report `json:"report,omitempty"`
-	Device   string        `json:"device,omitempty"`
+	// Kind is "write" or "backup".
+	Kind     string         `json:"kind,omitempty"`
+	Running  bool           `json:"running"`
+	Stage    string         `json:"stage,omitempty"`
+	Fraction float64        `json:"fraction"`
+	Bytes    int64          `json:"bytes,omitempty"`
+	Messages []string       `json:"messages,omitempty"`
+	Error    string         `json:"error,omitempty"`
+	Problems []string       `json:"problems,omitempty"`
+	Report   *flash.Report  `json:"report,omitempty"`
+	Backup   *backup.Report `json:"backup,omitempty"`
+	Device   string         `json:"device,omitempty"`
 }
 
 func newServer(addr, version string) *server {
@@ -122,6 +127,7 @@ func newServer(addr, version string) *server {
 	s.mux.HandleFunc("GET /api/devices", s.handleDevices)
 	s.mux.HandleFunc("POST /api/browse", s.handleBrowse)
 	s.mux.HandleFunc("POST /api/flash", s.handleFlash)
+	s.mux.HandleFunc("POST /api/backup", s.handleBackup)
 	s.mux.HandleFunc("GET /api/job", s.handleJob)
 	s.mux.HandleFunc("POST /api/cancel", s.handleCancel)
 	s.mux.HandleFunc("POST /api/forget", s.handleForget)
@@ -216,11 +222,25 @@ func writeErr(w http.ResponseWriter, status int, err error) {
 func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 	canWrite, why := flash.CanWriteDevices()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":   s.version,
-		"prefs":     profile.LoadPrefs(),
-		"can_write": canWrite,
-		"why_not":   why,
+		"version":          s.version,
+		"prefs":            profile.LoadPrefs(),
+		"can_write":        canWrite,
+		"why_not":          why,
+		"shrink_available": backup.ShrinkAvailable(),
+		"backup_dir":       backupDir(),
 	})
+}
+
+// backupDir suggests where backups go: Downloads, else the home folder.
+func backupDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	if st, err := os.Stat(filepath.Join(home, "Downloads")); err == nil && st.IsDir() {
+		return filepath.Join(home, "Downloads")
+	}
+	return home
 }
 
 type serverRef struct {
@@ -374,16 +394,10 @@ func (s *server) handleFlash(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.mu.Lock()
-	if s.state.Running {
-		s.mu.Unlock()
-		writeErr(w, http.StatusConflict, errors.New("a card is already being written"))
+	ctx, ok := s.startJob(w, "write", d)
+	if !ok {
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-	s.state = jobState{Running: true, Stage: job.StageOpen, Device: d.Describe()}
-	s.mu.Unlock()
 
 	if req.Remember && p != nil {
 		server := ""
@@ -394,36 +408,112 @@ func (s *server) handleFlash(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		defer cancel()
 		rep, err := job.Run(ctx, job.Request{
 			Source: src, Device: d, Profile: p,
 			AllowNonRemovable: req.AllowNonRemovable, SkipVerify: req.SkipVerify,
-		}, func(e job.Event) {
-			s.mu.Lock()
-			s.state.Stage, s.state.Fraction, s.state.Bytes = e.Stage, e.Fraction, e.Bytes
-			if e.Message != "" && e.Stage != job.StageOpen {
-				s.state.Messages = append(s.state.Messages, e.Message)
-			}
-			s.mu.Unlock()
-		})
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.state.Running = false
-		s.cancel = nil
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				err = errors.New("cancelled; the card is incomplete and must be written again")
-			}
-			s.state.Error = err.Error()
-			var ve *profile.ValidationError
-			if errors.As(err, &ve) {
-				s.state.Problems = ve.Problems
-			}
-			return
+		}, s.progress)
+		if errors.Is(err, context.Canceled) {
+			err = errors.New("cancelled; the card is incomplete and must be written again")
 		}
-		s.state.Stage, s.state.Fraction, s.state.Report = "done", 1, rep
+		s.finishJob(err, func(st *jobState) { st.Report = rep })
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]bool{"started": true})
+}
+
+type backupRequest struct {
+	Device            string `json:"device"`
+	Out               string `json:"out"`
+	Shrink            bool   `json:"shrink"`
+	AllowNonRemovable bool   `json:"allow_non_removable"`
+}
+
+func (s *server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	var req backupRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request"))
+		return
+	}
+	if !filepath.IsAbs(req.Out) {
+		writeErr(w, http.StatusBadRequest, errors.New("give the full path of the backup file"))
+		return
+	}
+	if err := backup.CheckOutput(req.Out); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if ok, why := flash.CanWriteDevices(); !ok {
+		writeErr(w, http.StatusForbidden, errors.New(why))
+		return
+	}
+	d, err := devices.Find(r.Context(), req.Device)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := job.CheckBackupDevice(d, req.AllowNonRemovable); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, ok := s.startJob(w, "backup", d)
+	if !ok {
+		return
+	}
+	go func() {
+		rep, err := job.Backup(ctx, job.BackupRequest{
+			Device: d, Out: req.Out, Shrink: req.Shrink, AllowNonRemovable: req.AllowNonRemovable,
+		}, s.progress)
+		if errors.Is(err, context.Canceled) {
+			err = errors.New("cancelled; no backup file was saved")
+		}
+		s.finishJob(err, func(st *jobState) { st.Backup = rep })
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]bool{"started": true})
+}
+
+// startJob claims the single job slot; it writes the error response and
+// returns false when a job is already running.
+func (s *server) startJob(w http.ResponseWriter, kind string, d devices.Device) (context.Context, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Running {
+		writeErr(w, http.StatusConflict, errors.New("a card is already being written or backed up"))
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.state = jobState{Kind: kind, Running: true, Stage: job.StageOpen, Device: d.Describe()}
+	return ctx, true
+}
+
+func (s *server) progress(e job.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.Stage, s.state.Fraction, s.state.Bytes = e.Stage, e.Fraction, e.Bytes
+	if e.Message != "" && e.Stage != job.StageOpen {
+		s.state.Messages = append(s.state.Messages, e.Message)
+	}
+}
+
+func (s *server) finishJob(err error, done func(*jobState)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.state.Running = false
+	s.cancel = nil
+	if err != nil {
+		s.state.Error = err.Error()
+		var ve *profile.ValidationError
+		if errors.As(err, &ve) {
+			s.state.Problems = ve.Problems
+		}
+		return
+	}
+	s.state.Stage, s.state.Fraction = "done", 1
+	done(&s.state)
 }
 
 func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {

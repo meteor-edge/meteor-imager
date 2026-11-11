@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/meteor-edge/meteor-imager/internal/diskimage"
 	"github.com/meteor-edge/meteor-imager/internal/profile"
+	"github.com/meteor-edge/meteor-imager/internal/shacrypt"
 )
 
 const (
@@ -443,7 +445,7 @@ func TestInjectBaseImageWritesOnlyMeteorenvV2(t *testing.T) {
 	fsck(t, path)
 }
 
-func TestInjectStockImageKeepsCloudInitPathAndWarnsAboutSSH(t *testing.T) {
+func TestInjectStockImageGivesTheSSHKeyToCloudInit(t *testing.T) {
 	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData, CmdlineFile: stockCmdline})
 	res := injectInto(t, path, v2Profile())
 
@@ -454,12 +456,142 @@ func TestInjectStockImageKeepsCloudInitPathAndWarnsAboutSSH(t *testing.T) {
 	if env != "METEOR_DOMAIN=fleet.example.com\nMETEOR_API_KEY=key_abc123\nMETEOR_NAME=Kitchen Pi\n" {
 		t.Errorf(".meteorenv = %q", env)
 	}
-	if !strings.Contains(strings.Join(res.Warnings, " "), "SSH keys are applied by Meteor base images only") {
+	var ud struct {
+		Keys   []string `yaml:"ssh_authorized_keys"`
+		RunCmd []string `yaml:"runcmd"`
+	}
+	if err := yaml.Unmarshal([]byte(readBack(t, path, UserDataFile)), &ud); err != nil {
+		t.Fatal(err)
+	}
+	if len(ud.Keys) != 1 || ud.Keys[0] != testSSHKey || !slices.Contains(ud.RunCmd, sshEnableCommand) {
+		t.Errorf("user-data = %+v", ud)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, " "), "No user set") {
 		t.Errorf("warnings = %v", res.Warnings)
 	}
-	if strings.Contains(env, testSSHKey) {
-		t.Error("SSH key written to a non-base image")
+}
+
+const testPassword = "correct horse battery"
+
+func v3Profile() *profile.FlashProfile {
+	p := v2Profile()
+	p.SchemaVersion = 3
+	on, off := true, false
+	p.User = &profile.User{Name: "ops", Password: testPassword}
+	p.SSH = &profile.SSH{Enabled: &on, PasswordAuthentication: &off, AuthorizedKeys: []string{testSSHKey}}
+	return p
+}
+
+func checkHash(t *testing.T, hash string) {
+	t.Helper()
+	if ok, err := shacrypt.Verify(testPassword, hash); err != nil || !ok {
+		t.Errorf("password hash %q does not verify (%v)", hash, err)
 	}
+}
+
+func TestInjectBaseImageUserAndSSH(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{BaseImageMarker: "meteor_settings=2\n", CmdlineFile: stockCmdline})
+	injectInto(t, path, v3Profile())
+
+	env := readBack(t, path, MeteorEnvFile)
+	if strings.Contains(env, testPassword) {
+		t.Fatal("plain-text password on the card")
+	}
+	vals := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(env), "\n") {
+		k, v, _ := strings.Cut(line, "=")
+		vals[k] = v
+	}
+	checkHash(t, vals["METEOR_USER_PASSWORD_HASH"])
+	for k, want := range map[string]string{
+		"METEOR_USER":               "ops",
+		"METEOR_SSH_ENABLED":        "true",
+		"METEOR_SSH_PASSWORD_AUTH":  "false",
+		"METEOR_SSH_AUTHORIZED_KEY": testSSHKey,
+	} {
+		if vals[k] != want {
+			t.Errorf("%s = %q, want %q", k, vals[k], want)
+		}
+	}
+	if _, ok := vals["METEOR_SSH_USER"]; ok {
+		t.Error("METEOR_SSH_USER written although the key goes to the user")
+	}
+}
+
+func TestInjectCloudInitUserAndSSH(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData, CmdlineFile: stockCmdline})
+	injectInto(t, path, v3Profile())
+	injectInto(t, path, v3Profile()) // a second write must not add the user twice
+
+	raw := readBack(t, path, UserDataFile)
+	if strings.Contains(raw, testPassword) {
+		t.Fatal("plain-text password on the card")
+	}
+	var ud struct {
+		Users []struct {
+			Name       string   `yaml:"name"`
+			Groups     string   `yaml:"groups"`
+			Sudo       string   `yaml:"sudo"`
+			LockPasswd *bool    `yaml:"lock_passwd"`
+			Passwd     string   `yaml:"passwd"`
+			Keys       []string `yaml:"ssh_authorized_keys"`
+		} `yaml:"users"`
+		PwAuth *bool    `yaml:"ssh_pwauth"`
+		Keys   []string `yaml:"ssh_authorized_keys"`
+		RunCmd []string `yaml:"runcmd"`
+	}
+	if err := yaml.Unmarshal([]byte(raw), &ud); err != nil {
+		t.Fatal(err)
+	}
+	if len(ud.Users) != 2 || ud.Users[0].Name != "pi" {
+		t.Fatalf("users = %+v", ud.Users)
+	}
+	u := ud.Users[1]
+	if u.Name != "ops" || !strings.Contains(u.Groups, "sudo") || u.Sudo == "" || u.LockPasswd == nil || *u.LockPasswd {
+		t.Errorf("user = %+v", u)
+	}
+	checkHash(t, u.Passwd)
+	if len(u.Keys) != 1 || u.Keys[0] != testSSHKey || len(ud.Keys) != 0 {
+		t.Errorf("key placement: user %v, top level %v", u.Keys, ud.Keys)
+	}
+	if ud.PwAuth == nil || *ud.PwAuth {
+		t.Errorf("ssh_pwauth = %v", ud.PwAuth)
+	}
+	if n := countOf(ud.RunCmd, sshEnableCommand); n != 1 {
+		t.Errorf("runcmd has %d ssh enable entries: %v", n, ud.RunCmd)
+	}
+	fsck(t, path)
+}
+
+func countOf(list []string, s string) int {
+	n := 0
+	for _, v := range list {
+		if v == s {
+			n++
+		}
+	}
+	return n
+}
+
+func TestInjectLegacyImageUserAndSSH(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{CmdlineFile: stockCmdline})
+	p := v3Profile()
+	p.Enrollment = nil
+	res := injectInto(t, path, p)
+
+	name, hash, _ := strings.Cut(strings.TrimSpace(readBack(t, path, UserconfFile)), ":")
+	if name != "ops" {
+		t.Errorf("userconf.txt user = %q", name)
+	}
+	checkHash(t, hash)
+	if got := readBack(t, path, SSHFile); got != "" {
+		t.Errorf("ssh file = %q", got)
+	}
+	joined := strings.Join(res.Warnings, " ")
+	if !strings.Contains(joined, "SSH key was not written") || !strings.Contains(joined, "password logins stay allowed") {
+		t.Errorf("warnings = %v", res.Warnings)
+	}
+	fsck(t, path)
 }
 
 // configDisk is syntheticDisk plus a third partition: FAT32 labelled METEORCFG.

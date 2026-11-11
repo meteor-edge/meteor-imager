@@ -33,6 +33,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.45; }
 .top { display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
 .brand { font-weight: 600; font-size: 17px; display: flex; align-items: center; gap: 8px; }
@@ -78,6 +79,7 @@ summary { cursor: pointer; color: var(--muted); }
 .tabs { display: flex; gap: 4px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
 .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; }
 .tabs button[aria-selected=true] { border-bottom-color: var(--accent); font-weight: 600; }
+.tabs.mode { margin-bottom: 16px; }
 
 .list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
 .item { display: flex; gap: 12px; align-items: flex-start; padding: 12px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
