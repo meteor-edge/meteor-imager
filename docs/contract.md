@@ -66,6 +66,7 @@ its value.
 **Saved preferences.** The desktop UI can remember non-secret fields only, in
 `<user config dir>/meteor-imager/prefs.json` with mode 0600: server address, domain, SSID, hidden
 flag, country, hostname, timezone, user name, SSH on/off, password login and SSH public key.
+Without saved SSH choices the UI turns SSH with password login on.
 
 **Desktop UI.** The settings step has two tabs: **General** (hostname, timezone, user and password,
 Wi-Fi, SSH), like Raspberry Pi Imager's OS customisation, and **MeteorCloud** (domain, enrollment

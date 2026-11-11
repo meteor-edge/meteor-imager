@@ -42,8 +42,10 @@ Record the version, OS version, card reader and card for each run.
 - [ ] **General** and **MeteorCloud** tabs switch; a problem on the other tab opens that tab.
 - [ ] Username with capitals or `root`, an empty user password, or "public key only" without a key
       is shown inline.
+- [ ] On a fresh start (no saved settings) **Enable SSH** is ticked with password authentication.
 - [ ] With **Remember** ticked, the next start pre-fills domain, SSID, country, hostname, timezone,
-      username and SSH choices, but **not** the passwords or key. **Forget saved settings** clears them.
+      username and SSH choices (including SSH unticked), but **not** the passwords or key.
+      **Forget saved settings** clears them.
 - [ ] Check the prefs file (`~/.config/meteor-imager/prefs.json`, `~/Library/Application Support/…`,
       `%AppData%\meteor-imager\…`): no secrets, mode 0600 on Unix.
 
@@ -67,6 +69,7 @@ Record the version, OS version, card reader and card for each run.
 - [ ] Unplugging the card during Write gives an error and does not crash.
 - [ ] A card smaller than the image is refused ("larger than the card").
 - [ ] After **Done**, the card is ejected (Windows: safe to remove).
+- [ ] With a user and SSH password login, **Done** shows the login command (`ssh <user>@<hostname>.local`).
 - [ ] **Write another card** goes back to the card step with settings kept.
 
 ### Card contents (mount the boot partition on a PC)

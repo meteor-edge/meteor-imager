@@ -128,13 +128,13 @@
     </fieldset>
 
     <fieldset>
-      <legend><label class="check"><input type="checkbox" id="use-ssh"> Enable SSH</label></legend>
+      <legend><label class="check"><input type="checkbox" id="use-ssh" checked> Enable SSH</label></legend>
       <div id="ssh-fields">
         <label class="check"><input type="radio" name="ssh-auth" id="ssh-auth-password" checked> Use password authentication</label>
         <label class="check"><input type="radio" name="ssh-auth" id="ssh-auth-key"> Allow public-key authentication only</label>
         <label for="ssh-key">SSH public key <span id="ssh-key-optional" class="muted">(optional)</span></label>
         <input id="ssh-key" placeholder="ssh-ed25519 AAAA… you@laptop" autocomplete="off" spellcheck="false">
-        <p class="hint">Added for the user above, or the image’s first user.</p>
+        <p class="hint">With password authentication you log in as the user above: <span class="mono">ssh user@hostname.local</span>. The key is added for that user, or the image’s first user.</p>
       </div>
     </fieldset>
     </div>

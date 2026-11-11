@@ -19,8 +19,10 @@ type Prefs struct {
 	Hostname     string `json:"hostname,omitempty"`
 	Timezone     string `json:"timezone,omitempty"`
 	UserName     string `json:"user_name,omitempty"`
-	SSHEnabled   bool   `json:"ssh_enabled,omitempty"`
-	SSHPassword  bool   `json:"ssh_password_authentication,omitempty"`
+	// SSHEnabled and SSHPassword are nil when never chosen; the UI then turns
+	// SSH with password login on.
+	SSHEnabled  *bool `json:"ssh_enabled,omitempty"`
+	SSHPassword *bool `json:"ssh_password_authentication,omitempty"`
 	// SSHKey is a public key: not a secret.
 	SSHKey string `json:"ssh_authorized_key,omitempty"`
 }
@@ -85,11 +87,14 @@ func PrefsFrom(serverURL string, p *FlashProfile) Prefs {
 	if p.User != nil {
 		out.UserName = p.User.Name
 	}
+	// No SSH settings on a card means the SSH box was unticked: remember that.
+	off := false
+	out.SSHEnabled = &off
 	if on := p.SSHEnabled(); on != nil {
-		out.SSHEnabled = *on
+		out.SSHEnabled = on
 	}
-	if p.SSH != nil && p.SSH.PasswordAuthentication != nil {
-		out.SSHPassword = *p.SSH.PasswordAuthentication
+	if p.SSH != nil {
+		out.SSHPassword = p.SSH.PasswordAuthentication
 	}
 	if p.Timezone != nil {
 		out.Timezone = *p.Timezone

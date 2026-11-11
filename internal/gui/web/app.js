@@ -333,6 +333,8 @@ async function startWrite() {
     req.path = $("file-path").value.trim();
   }
   $("write").disabled = true;
+  state.sshLogin = profile && profile.ssh && profile.ssh.password_authentication && profile.user
+    ? `ssh ${profile.user.name}@${profile.hostname ? profile.hostname + ".local" : "<device IP>"}` : "";
   try {
     await api("POST", "/api/flash", req);
   } catch (e) {
@@ -403,6 +405,7 @@ async function poll() {
   const r = st.report || {};
   const lines = [el("p", { class: "success" }, `Card written${r.verified ? " and verified" : ""}. You can remove it now.`)];
   if (r.boot && r.boot.written && r.boot.written.length) lines.push(el("p", { class: "muted" }, "Boot partition: " + r.boot.written.join(", ")));
+  if (state.sshLogin) lines.push(el("p", {}, "After first boot, log in with the user’s password: ", el("span", { class: "mono" }, state.sshLogin)));
   for (const w of (r.boot && r.boot.warnings) || []) lines.push(el("p", { class: "banner warn" }, w));
   $("result").replaceChildren(...lines);
 }
@@ -467,8 +470,9 @@ function applyPrefs(p) {
   $("timezone").value = p.timezone || "";
   $("user-name").value = p.user_name || "";
   $("use-user").checked = !!p.user_name;
-  $("use-ssh").checked = !!p.ssh_enabled;
-  $(p.ssh_enabled && !p.ssh_password_authentication ? "ssh-auth-key" : "ssh-auth-password").checked = true;
+  // SSH with password login is on unless it was turned off last time.
+  $("use-ssh").checked = p.ssh_enabled !== false;
+  $(p.ssh_password_authentication === false ? "ssh-auth-key" : "ssh-auth-password").checked = true;
   $("ssh-key").value = p.ssh_authorized_key || "";
 }
 

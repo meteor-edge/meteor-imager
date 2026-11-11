@@ -190,8 +190,14 @@ func TestV3UserAndSSH(t *testing.T) {
 	if strings.Contains(string(b), "s3cret") {
 		t.Errorf("redacted copy has the password: %s", b)
 	}
-	if prefs := PrefsFrom("", p); prefs.UserName != "ops" || !prefs.SSHEnabled || prefs.SSHPassword {
+	if prefs := PrefsFrom("", p); prefs.UserName != "ops" || prefs.SSHEnabled == nil || !*prefs.SSHEnabled ||
+		prefs.SSHPassword == nil || *prefs.SSHPassword {
 		t.Errorf("prefs = %+v", prefs)
+	}
+	// A card without SSH settings means the SSH box was unticked.
+	noSSH := &FlashProfile{SchemaVersion: 3, User: p.User}
+	if prefs := PrefsFrom("", noSSH); prefs.SSHEnabled == nil || *prefs.SSHEnabled || prefs.SSHPassword != nil {
+		t.Errorf("prefs without ssh = %+v", prefs)
 	}
 	p.Clear()
 	if p.User.Password != "" {

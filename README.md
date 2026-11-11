@@ -39,7 +39,9 @@ Get the build for your system from [Releases](https://github.com/meteor-edge/met
 2. **Settings.** Two tabs:
    - **General**, like Raspberry Pi Imager: hostname, timezone, **username and password** (the
      image's first user is renamed; only a hash of the password goes on the card), **Wi-Fi** name,
-     password and country, and **SSH** (password login, or public key only with your key).
+     password and country, and **SSH** (password login, or public key only with your key). SSH with
+     password login is on by default, so after first boot you can `ssh <user>@<hostname>.local` with
+     the username and password you set; untick **Enable SSH** to leave the image's SSH setting alone.
    - **MeteorCloud**: the **domain** the Pi connects to (filled in from the address), an
      **enrollment key** (`key_…`, created in MeteorCloud under Devices → Enrollment keys) and an
      optional device name. Untick it to write a card that does not register itself.
