@@ -21,7 +21,7 @@ install -Dm644 "$src/THIRD_PARTY_LICENSES.txt" "$pkg/usr/share/doc/meteor-imager
 mkdir -p "$pkg/DEBIAN"
 cat > "$pkg/DEBIAN/control" <<CONTROL
 Package: meteor-imager
-Version: ${version}
+Version: ${version//-/\~}
 Architecture: $arch
 Maintainer: Meteor Edge <noreply@github.com>
 Homepage: https://github.com/meteor-edge/meteor-imager

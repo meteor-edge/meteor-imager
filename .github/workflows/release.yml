@@ -113,5 +113,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" release/* \
+          # Tags like v0.2.0-rc.1 are pre-releases: listed, but not "Latest".
+          pre=()
+          [[ "${{ github.ref_name }}" == *-* ]] && pre=(--prerelease)
+          gh release create "${{ github.ref_name }}" release/* "${pre[@]}" \
             --repo "${{ github.repository }}" --title "Meteor Imager ${{ github.ref_name }}" --generate-notes

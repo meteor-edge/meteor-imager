@@ -17,7 +17,8 @@ done
 app="$work/dmg/Meteor Imager.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$work/meteor-imager" "$app/Contents/MacOS/meteor-imager"
-sed "s/@VERSION@/${version}/g" "$root/packaging/macos/Info.plist" > "$app/Contents/Info.plist"
+# Bundle versions must be numeric: 0.2.0-rc.1 -> 0.2.0.
+sed "s/@VERSION@/${version%%-*}/g" "$root/packaging/macos/Info.plist" > "$app/Contents/Info.plist"
 cp "$root/dist/darwin_arm64/THIRD_PARTY_LICENSES.txt" "$root/LICENSE" "$app/Contents/Resources/"
 
 iconset="$work/MeteorImager.iconset"
