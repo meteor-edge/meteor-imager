@@ -550,7 +550,7 @@ func (s *server) handleQuit(w http.ResponseWriter, r *http.Request) {
 	running := s.state.Running
 	s.mu.Unlock()
 	if running {
-		writeErr(w, http.StatusConflict, errors.New("a card is being written; cancel it first"))
+		writeErr(w, http.StatusConflict, errors.New("a card is still being written or backed up; cancel it first"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
