@@ -56,7 +56,10 @@ func TestMatchesOpenSSL(t *testing.T) {
 			t.Fatal(err)
 		}
 		salt := strings.Split(h, "$")[2]
-		out, err := exec.Command("openssl", "passwd", "-6", "-salt", salt, pw).Output()
+		// stdin, not an argument: Windows re-encodes non-ASCII command-line arguments.
+		cmd := exec.Command("openssl", "passwd", "-6", "-salt", salt, "-stdin")
+		cmd.Stdin = strings.NewReader(pw + "\n")
+		out, err := cmd.Output()
 		if err != nil {
 			t.Fatal(err)
 		}
