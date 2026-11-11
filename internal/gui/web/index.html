@@ -68,7 +68,9 @@
           <input id="api-key" type="password" placeholder="key_…" autocomplete="new-password" spellcheck="false">
           <button type="button" class="reveal" data-for="api-key">Show</button>
         </div>
-        <p class="hint">Create one in MeteorCloud under Devices → Enrollment keys.</p>
+        <p class="hint">Create one in MeteorCloud under Devices → Enrollment keys. Give it an expiry date and revoke it when the batch is done.</p>
+        <label for="device-name">Device name in MeteorCloud (optional)</label>
+        <input id="device-name" placeholder="Same as the hostname" maxlength="63" autocomplete="off" spellcheck="false">
       </div>
     </fieldset>
 
@@ -105,7 +107,10 @@
           <input id="timezone" placeholder="Europe/Berlin" autocomplete="off" spellcheck="false">
         </div>
       </div>
-      <label class="check"><input type="checkbox" id="remember" checked> Remember domain, Wi-Fi name, country, hostname and timezone (never passwords or keys)</label>
+      <label for="ssh-key">SSH public key (optional)</label>
+      <input id="ssh-key" placeholder="ssh-ed25519 AAAA… you@laptop" autocomplete="off" spellcheck="false">
+      <p class="hint">Added for the image’s login user. Applied by Meteor base images (MeteorCloud first boot preinstalled).</p>
+      <label class="check"><input type="checkbox" id="remember" checked> Remember domain, Wi-Fi name, country, hostname, timezone and SSH key (never passwords or enrollment keys)</label>
       <button id="forget" class="link" type="button">Forget saved settings</button>
     </details>
 

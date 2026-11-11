@@ -14,8 +14,9 @@ import (
 	"time"
 )
 
-// SchemaVersion is the FlashProfile JSON version this build reads and writes.
-const SchemaVersion = 1
+// SchemaVersion is the FlashProfile JSON version this build writes. It also reads
+// version 1 (no device name, no SSH key).
+const SchemaVersion = 2
 
 // FlashProfile is everything written to the boot partition. Secrets (Wi-Fi PSK,
 // enrollment API key) are only ever held in memory or in a file the operator
@@ -47,18 +48,27 @@ type Enrollment struct {
 	// "192.168.0.10:8000". No scheme; first boot tries http then https.
 	MeteorDomain string `json:"meteor_domain"`
 	MeteorAPIKey string `json:"meteor_api_key"`
+	// DeviceName is the name the device asks for in MeteorCloud (v2). Empty: the hostname.
+	DeviceName string `json:"device_name,omitempty"`
 }
 
-// SSH is reserved in v1: set values are rejected so nothing is silently ignored.
+// SSH adds a public key for the image's login user (v2). Only Meteor base images
+// (with MeteorCloud first boot) apply it.
 type SSH struct {
-	Enabled        *bool    `json:"enabled"`
-	AuthorizedKeys []string `json:"authorized_keys"`
+	// Enabled is reserved: set values are rejected so nothing is silently ignored.
+	Enabled *bool `json:"enabled,omitempty"`
+	// AuthorizedKeys holds one OpenSSH public key.
+	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
+	// User gets the key; empty means the image's first login user.
+	User string `json:"user,omitempty"`
 }
 
 var (
 	countryPattern  = regexp.MustCompile(`^[A-Z]{2}$`)
 	hostnamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	domainPattern   = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
+	sshKeyPattern   = regexp.MustCompile(`^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+( [^\r\n]*)?$`)
+	userPattern     = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 )
 
 // Parse reads a FlashProfile, rejecting unknown fields and newer schema versions.
@@ -83,11 +93,11 @@ func (p *FlashProfile) Validate() error {
 	var problems []string
 	add := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
-	if p.SchemaVersion != SchemaVersion {
-		add("schema_version must be %d", SchemaVersion)
+	if p.SchemaVersion < 1 || p.SchemaVersion > SchemaVersion {
+		add("schema_version must be 1 or %d", SchemaVersion)
 	}
-	if p.WiFi == nil && p.Enrollment == nil && p.Hostname == nil && p.Timezone == nil {
-		add("nothing to write: set wifi, enrollment, hostname or timezone")
+	if p.WiFi == nil && p.Enrollment == nil && p.Hostname == nil && p.Timezone == nil && p.SSHKey() == "" {
+		add("nothing to write: set wifi, enrollment, hostname, timezone or an SSH key")
 	}
 	if w := p.WiFi; w != nil {
 		if n := len(w.SSID); n == 0 || n > 32 {
@@ -114,6 +124,14 @@ func (p *FlashProfile) Validate() error {
 		if !strings.HasPrefix(e.MeteorAPIKey, "key_") || len(e.MeteorAPIKey) < 8 || strings.ContainsAny(e.MeteorAPIKey, " \t\r\n=\"'") {
 			add("enrollment.meteor_api_key must be a MeteorCloud enrollment key (starts with key_)")
 		}
+		if e.DeviceName != "" {
+			if p.SchemaVersion < 2 {
+				add("enrollment.device_name needs schema_version 2")
+			}
+			if len(e.DeviceName) > 63 || strings.TrimSpace(e.DeviceName) != e.DeviceName || strings.ContainsAny(e.DeviceName, "\x00\r\n=") {
+				add("enrollment.device_name must be 1 to 63 characters, without line breaks or leading/trailing spaces")
+			}
+		}
 	}
 	if p.Hostname != nil && !hostnamePattern.MatchString(*p.Hostname) {
 		add("hostname must be 1 to 63 lower-case letters, digits or hyphens")
@@ -123,8 +141,23 @@ func (p *FlashProfile) Validate() error {
 			add("timezone must be an IANA name such as Europe/Berlin")
 		}
 	}
-	if p.SSH != nil && (p.SSH.Enabled != nil || len(p.SSH.AuthorizedKeys) > 0) {
-		add("ssh is reserved for a later version and is not written yet; remove it")
+	if s := p.SSH; s != nil {
+		switch {
+		case p.SchemaVersion < 2 && (s.Enabled != nil || len(s.AuthorizedKeys) > 0 || s.User != ""):
+			add("ssh needs schema_version 2")
+		case s.Enabled != nil:
+			add("ssh.enabled is reserved; remove it (a key enables SSH)")
+		case len(s.AuthorizedKeys) > 1:
+			add("ssh.authorized_keys takes one key")
+		}
+		for _, k := range s.AuthorizedKeys {
+			if !sshKeyPattern.MatchString(k) {
+				add("ssh.authorized_keys must be an OpenSSH public key (ssh-ed25519 AAAA… comment)")
+			}
+		}
+		if s.User != "" && !userPattern.MatchString(s.User) {
+			add("ssh.user must be a Linux user name")
+		}
 	}
 	if len(p.Extras) > 0 {
 		add("extras is reserved for a later version; remove it")
@@ -133,6 +166,14 @@ func (p *FlashProfile) Validate() error {
 		return &ValidationError{Problems: problems}
 	}
 	return nil
+}
+
+// SSHKey returns the SSH public key to install, or "".
+func (p *FlashProfile) SSHKey() string {
+	if p.SSH == nil || len(p.SSH.AuthorizedKeys) == 0 {
+		return ""
+	}
+	return p.SSH.AuthorizedKeys[0]
 }
 
 // ValidateDomain checks a METEOR_DOMAIN value: a host or host:port, no scheme or path.

@@ -18,6 +18,8 @@ type Prefs struct {
 	MeteorDomain string `json:"meteor_domain,omitempty"`
 	Hostname     string `json:"hostname,omitempty"`
 	Timezone     string `json:"timezone,omitempty"`
+	// SSHKey is a public key: not a secret.
+	SSHKey string `json:"ssh_authorized_key,omitempty"`
 }
 
 // PrefsPath is <user config dir>/meteor-imager/prefs.json.
@@ -76,6 +78,7 @@ func PrefsFrom(serverURL string, p *FlashProfile) Prefs {
 	if p.Hostname != nil {
 		out.Hostname = *p.Hostname
 	}
+	out.SSHKey = p.SSHKey()
 	if p.Timezone != nil {
 		out.Timezone = *p.Timezone
 	}

@@ -18,6 +18,7 @@ type firstrunEnv struct {
 	bin     string
 	calls   string
 	logFile string
+	unit    string // meteorcli-firstboot.service of a base image; absent by default
 }
 
 const testKey = "key_supersecret123"
@@ -38,6 +39,7 @@ func newFirstrunEnv(t *testing.T) *firstrunEnv {
 		bin:     filepath.Join(dir, "bin"),
 		calls:   filepath.Join(dir, "calls.log"),
 		logFile: filepath.Join(dir, "firstrun.log"),
+		unit:    filepath.Join(dir, "meteorcli-firstboot.service"),
 	}
 	for _, d := range []string{e.boot, e.config, e.bin} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -94,6 +96,7 @@ func (e *firstrunEnv) run() (string, error) {
 		"METEOR_FIRSTRUN_LOG=" + e.logFile,
 		"METEOR_RETRIES=2",
 		"METEOR_RETRY_SECONDS=0",
+		"METEOR_FIRSTBOOT_UNIT=" + e.unit,
 	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -224,5 +227,24 @@ func TestFirstrunRejectsMissingKey(t *testing.T) {
 	}
 	if strings.Contains(e.callLog(), "request-token") || !e.bootHas(FirstrunFile) {
 		t.Error("must not request or remove anything without a key")
+	}
+}
+
+func TestFirstrunLeavesEnrollmentToABaseImage(t *testing.T) {
+	e := newFirstrunEnv(t)
+	e.meteorcli(true, true)
+	e.write(e.unit, "[Unit]\n", 0o644)
+	out, err := e.run()
+	if err != nil {
+		t.Fatalf("firstrun failed: %v\n%s", err, out)
+	}
+	if strings.Contains(e.callLog(), "request-token") {
+		t.Errorf("must not send a second request next to meteorcli-firstboot:\n%s", e.callLog())
+	}
+	if e.bootHas(FirstrunFile) {
+		t.Error("the script should remove itself")
+	}
+	if !e.bootHas(MeteorEnvFile) {
+		t.Error(".meteorenv must stay for meteorcli-firstboot")
 	}
 }

@@ -22,6 +22,10 @@ const (
 	CmdlineFile       = "cmdline.txt"
 	WPASupplicantFile = "wpa_supplicant.conf"
 	FirstrunFile      = "meteor-firstrun.sh"
+	// BaseImageMarker is on the config partition of Meteor base images (MeteorCloud
+	// first boot preinstalled, see meteor-cloud's install-meteorcli-firstboot.sh).
+	// Those images apply .meteorenv v2 themselves: Wi-Fi, hostname, timezone, SSH key.
+	BaseImageMarker = ".meteor-settings"
 )
 
 // FirstrunScript asks MeteorCloud for a device token on first boot, then removes
@@ -38,6 +42,9 @@ type Result struct {
 	// Bookworm 2024-11): Wi-Fi then goes to wpa_supplicant.conf, and enrollment
 	// needs MeteorCloud first boot installed in the image.
 	CloudInit bool `json:"cloud_init"`
+	// BaseImage is true for Meteor base images: everything went into .meteorenv,
+	// and cloud-init files were left alone.
+	BaseImage bool `json:"base_image,omitempty"`
 }
 
 // Options tune injection; the zero value is right for normal use.
@@ -56,7 +63,7 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 	if opt.Now != nil {
 		now = opt.Now
 	}
-	res := &Result{CloudInit: v.Exists(UserDataFile)}
+	res := &Result{CloudInit: v.Exists(UserDataFile), BaseImage: v.Exists(BaseImageMarker)}
 
 	write := func(name string, data []byte) error {
 		if err := v.WriteFile(name, data); err != nil {
@@ -64,6 +71,22 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 		}
 		res.Written = append(res.Written, name)
 		return nil
+	}
+
+	if res.BaseImage {
+		// The image's meteorcli-settings.service applies every setting early in
+		// boot and deletes .meteorenv; cloud-init must not run a second enrollment.
+		if p.Enrollment == nil {
+			res.Warnings = append(res.Warnings, "No enrollment key: the device will not join MeteorCloud by itself.")
+		}
+		if err := write(MeteorEnvFile, MeteorEnvV2(p)); err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
+
+	if p.SSHKey() != "" {
+		res.Warnings = append(res.Warnings, "SSH keys are applied by Meteor base images only; this image is not one, so the key was not written.")
 	}
 
 	if p.Enrollment != nil {
@@ -148,7 +171,46 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 
 // MeteorEnv is the .meteorenv file MeteorCloud first boot reads (KEY=value lines).
 func MeteorEnv(e *profile.Enrollment) []byte {
-	return []byte("METEOR_DOMAIN=" + e.MeteorDomain + "\nMETEOR_API_KEY=" + e.MeteorAPIKey + "\n")
+	s := "METEOR_DOMAIN=" + e.MeteorDomain + "\nMETEOR_API_KEY=" + e.MeteorAPIKey + "\n"
+	if e.DeviceName != "" {
+		s += "METEOR_NAME=" + e.DeviceName + "\n"
+	}
+	return []byte(s)
+}
+
+// MeteorEnvV2 is .meteorenv for Meteor base images: enrollment plus every other
+// setting, applied by meteorcli-settings.service. KEY=value lines, value to the end
+// of the line (validated profiles hold no line breaks).
+func MeteorEnvV2(p *profile.FlashProfile) []byte {
+	var b strings.Builder
+	kv := func(k, v string) { b.WriteString(k + "=" + v + "\n") }
+	kv("METEOR_ENV_VERSION", "2")
+	if e := p.Enrollment; e != nil {
+		kv("METEOR_DOMAIN", e.MeteorDomain)
+		kv("METEOR_API_KEY", e.MeteorAPIKey)
+		if e.DeviceName != "" {
+			kv("METEOR_NAME", e.DeviceName)
+		}
+	}
+	if p.Hostname != nil {
+		kv("METEOR_HOSTNAME", *p.Hostname)
+	}
+	if p.Timezone != nil {
+		kv("METEOR_TIMEZONE", *p.Timezone)
+	}
+	if w := p.WiFi; w != nil {
+		kv("METEOR_WIFI_SSID", w.SSID)
+		kv("METEOR_WIFI_PSK", w.PSK)
+		kv("METEOR_WIFI_COUNTRY", w.Country)
+		kv("METEOR_WIFI_HIDDEN", fmt.Sprint(w.Hidden))
+	}
+	if k := p.SSHKey(); k != "" {
+		kv("METEOR_SSH_AUTHORIZED_KEY", k)
+		if p.SSH.User != "" {
+			kv("METEOR_SSH_USER", p.SSH.User)
+		}
+	}
+	return []byte(b.String())
 }
 
 // withDatasource sets "ds=nocloud;i=<id>" on the single cmdline.txt line,

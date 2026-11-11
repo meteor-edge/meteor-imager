@@ -396,3 +396,126 @@ func TestInjectAboveCluster65535(t *testing.T) {
 	}
 	fsck(t, path)
 }
+
+const testSSHKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnlyForTests user@laptop"
+
+func v2Profile() *profile.FlashProfile {
+	p := fullProfile()
+	p.SchemaVersion = 2
+	p.Enrollment.DeviceName = "Kitchen Pi"
+	p.SSH = &profile.SSH{AuthorizedKeys: []string{testSSHKey}, User: "pi"}
+	return p
+}
+
+func TestInjectBaseImageWritesOnlyMeteorenvV2(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{
+		BaseImageMarker: "meteor_settings=2\n",
+		UserDataFile:    stockUserData,
+		CmdlineFile:     stockCmdline,
+	})
+	res := injectInto(t, path, v2Profile())
+
+	if !res.BaseImage || len(res.Written) != 1 || res.Written[0] != MeteorEnvFile {
+		t.Fatalf("result = %+v", res)
+	}
+	want := "METEOR_ENV_VERSION=2\n" +
+		"METEOR_DOMAIN=fleet.example.com\n" +
+		"METEOR_API_KEY=key_abc123\n" +
+		"METEOR_NAME=Kitchen Pi\n" +
+		"METEOR_HOSTNAME=pi-kitchen\n" +
+		"METEOR_TIMEZONE=Europe/Berlin\n" +
+		"METEOR_WIFI_SSID=Cafe \"Wi-Fi\": yes\n" +
+		"METEOR_WIFI_PSK=p#ss: word\n" +
+		"METEOR_WIFI_COUNTRY=DE\n" +
+		"METEOR_WIFI_HIDDEN=false\n" +
+		"METEOR_SSH_AUTHORIZED_KEY=" + testSSHKey + "\n" +
+		"METEOR_SSH_USER=pi\n"
+	if got := readBack(t, path, MeteorEnvFile); got != want {
+		t.Errorf(".meteorenv:\n%s\nwant:\n%s", got, want)
+	}
+	// cloud-init must not run a second enrollment on a base image.
+	if got := readBack(t, path, UserDataFile); got != stockUserData {
+		t.Errorf("user-data changed:\n%s", got)
+	}
+	if got := readBack(t, path, CmdlineFile); got != stockCmdline {
+		t.Errorf("cmdline.txt changed: %q", got)
+	}
+	fsck(t, path)
+}
+
+func TestInjectStockImageKeepsCloudInitPathAndWarnsAboutSSH(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData, CmdlineFile: stockCmdline})
+	res := injectInto(t, path, v2Profile())
+
+	if res.BaseImage || !res.CloudInit {
+		t.Fatalf("result = %+v", res)
+	}
+	env := readBack(t, path, MeteorEnvFile)
+	if env != "METEOR_DOMAIN=fleet.example.com\nMETEOR_API_KEY=key_abc123\nMETEOR_NAME=Kitchen Pi\n" {
+		t.Errorf(".meteorenv = %q", env)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, " "), "SSH keys are applied by Meteor base images only") {
+		t.Errorf("warnings = %v", res.Warnings)
+	}
+	if strings.Contains(env, testSSHKey) {
+		t.Error("SSH key written to a non-base image")
+	}
+}
+
+// configDisk is syntheticDisk plus a third partition: FAT32 labelled METEORCFG.
+func configDisk(t *testing.T) string {
+	t.Helper()
+	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData})
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cfgStart := uint32(bootStart + bootSectors + rootSectors)
+	if err := f.Truncate(int64(cfgStart+bootSectors) * 512); err != nil {
+		t.Fatal(err)
+	}
+	mbr := make([]byte, 512)
+	if _, err := f.ReadAt(mbr, 0); err != nil {
+		t.Fatal(err)
+	}
+	e := mbr[446+16*2:]
+	e[4] = 0x0c
+	binary.LittleEndian.PutUint32(e[8:], cfgStart)
+	binary.LittleEndian.PutUint32(e[12:], bootSectors)
+	if _, err := f.WriteAt(mbr, 0); err != nil {
+		t.Fatal(err)
+	}
+	dev := &partitionDevice{disk: f, offset: int64(cfgStart) * 512, size: bootSectors * 512}
+	var fm fat.Formatter
+	if err := fm.Format(dev, 512, bootSectors, fat.FormatParams{Label: ConfigLabel, Format: fat.FormatFAT32}); err != nil {
+		t.Fatalf("format: %v", err)
+	}
+	// The formatter leaves "NO NAME"; set the boot-sector label as mkfs.vfat -n does.
+	if _, err := f.WriteAt([]byte("METEORCFG  "), int64(cfgStart)*512+71); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestOpenBootPrefersTheMeteorConfigPartition(t *testing.T) {
+	path := configDisk(t)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	v, err := OpenBoot(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Label != ConfigLabel || v.Partition.Index != 3 {
+		t.Errorf("opened partition %d labelled %q", v.Partition.Index, v.Label)
+	}
+	if v.Exists(UserDataFile) {
+		t.Error("expected the empty config partition, not the boot partition")
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

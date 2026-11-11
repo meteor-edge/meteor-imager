@@ -4,6 +4,7 @@ package bootfs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -30,12 +31,19 @@ type Volume struct {
 	fs        fat.FS
 }
 
-// OpenBoot finds the first partition holding a FAT filesystem and mounts it read-write.
+// ConfigLabel marks a FAT partition that Meteor base images reserve for settings
+// (Jetson, NUC and other devices without a FAT boot partition). It wins over the boot partition.
+const ConfigLabel = "METEORCFG"
+
+// OpenBoot mounts the partition settings go to, read-write: a FAT partition
+// labelled METEORCFG if there is one, otherwise the first FAT partition
+// (the Raspberry Pi boot partition, or the EFI system partition).
 func OpenBoot(d Disk) (*Volume, error) {
 	parts, err := diskimage.ReadPartitions(d)
 	if err != nil {
 		return nil, err
 	}
+	var first *Volume
 	var lastErr error
 	for _, p := range parts {
 		if !p.MaybeFAT {
@@ -50,12 +58,46 @@ func OpenBoot(d Disk) (*Volume, error) {
 		if label, err := v.fs.AppendLabel(nil); err == nil {
 			v.Label = strings.TrimSpace(string(label))
 		}
-		return v, nil
+		if v.Label == "" {
+			v.Label = bootSectorLabel(d, p)
+		}
+		if strings.EqualFold(v.Label, ConfigLabel) {
+			if first != nil {
+				first.Close()
+			}
+			return v, nil
+		}
+		if first == nil {
+			first = v
+		} else {
+			v.Close()
+		}
+	}
+	if first != nil {
+		return first, nil
 	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("%w (%v)", ErrNoBootPartition, lastErr)
 	}
 	return nil, ErrNoBootPartition
+}
+
+// bootSectorLabel reads the volume label from the FAT boot sector (BS_VolLab), for
+// volumes whose root directory has no label entry. "NO NAME" counts as no label.
+func bootSectorLabel(d Disk, p diskimage.Partition) string {
+	bs := make([]byte, diskimage.SectorSize)
+	if _, err := d.ReadAt(bs, p.Offset()); err != nil {
+		return ""
+	}
+	off := 43 // FAT12/16
+	if binary.LittleEndian.Uint16(bs[22:24]) == 0 {
+		off = 71 // FAT32: BPB_FATSz16 is 0
+	}
+	label := strings.TrimSpace(string(bs[off : off+11]))
+	if label == "NO NAME" {
+		return ""
+	}
+	return label
 }
 
 // Close flushes and unmounts the filesystem.

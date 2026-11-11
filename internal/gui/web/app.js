@@ -116,9 +116,11 @@ function renderImages() {
 
 // ---------- Step 2: settings ----------
 function buildProfile() {
-  const p = { schema_version: 1, hostname: null, timezone: null };
+  const p = { schema_version: 2, hostname: null, timezone: null };
   if ($("use-enroll").checked) {
     p.enrollment = { meteor_domain: $("domain").value.trim(), meteor_api_key: $("api-key").value.trim() };
+    const name = $("device-name").value.trim();
+    if (name) p.enrollment.device_name = name;
   }
   if ($("use-wifi").checked) {
     p.wifi = { ssid: $("ssid").value, psk: $("psk").value, hidden: $("hidden-ssid").checked, country: $("country").value.trim().toUpperCase() };
@@ -127,13 +129,15 @@ function buildProfile() {
   const tz = $("timezone").value.trim();
   if (host) p.hostname = host;
   if (tz) p.timezone = tz;
+  const sshKey = $("ssh-key").value.trim();
+  if (sshKey) p.ssh = { authorized_keys: [sshKey] };
   return p;
 }
 
 function checkSettings() {
   const problems = [];
   const p = buildProfile();
-  if (!p.enrollment && !p.wifi && !p.hostname && !p.timezone) {
+  if (!p.enrollment && !p.wifi && !p.hostname && !p.timezone && !p.ssh) {
     return { profile: null, problems }; // write the image unchanged
   }
   if (p.enrollment) {
@@ -144,6 +148,9 @@ function checkSettings() {
     if (!p.wifi.ssid) problems.push("Enter the Wi-Fi network name.");
     if (p.wifi.psk.length < 8 || p.wifi.psk.length > 63) problems.push("The Wi-Fi password must be 8 to 63 characters.");
     if (!/^[A-Z]{2}$/.test(p.wifi.country)) problems.push("Enter the two-letter Wi-Fi country code, e.g. DE.");
+  }
+  if (p.ssh && !/^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-\S+) [A-Za-z0-9+/=]+( .*)?$/.test(p.ssh.authorized_keys[0])) {
+    problems.push("The SSH key must be an OpenSSH public key (ssh-ed25519 AAAA… comment).");
   }
   return { profile: p, problems };
 }
@@ -207,6 +214,8 @@ function renderSummary() {
   if (profile && profile.wifi) rows.push(["Wi-Fi", `${profile.wifi.ssid}${profile.wifi.hidden ? " (hidden)" : ""}, ${profile.wifi.country}, password ••••••••`]);
   if (profile && profile.hostname) rows.push(["Hostname", profile.hostname]);
   if (profile && profile.timezone) rows.push(["Timezone", profile.timezone]);
+  if (profile && profile.enrollment && profile.enrollment.device_name) rows.push(["Device name", profile.enrollment.device_name]);
+  if (profile && profile.ssh) rows.push(["SSH key", profile.ssh.authorized_keys[0].split(" ").slice(0, 2).join(" ").slice(0, 40) + "…"]);
   dl.replaceChildren(...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)]));
   const d = state.device;
   $("erase-device").textContent = `${d.path} · ${fmtSize(d.size_bytes)} · ${d.model || "Unknown device"}`;
@@ -309,6 +318,7 @@ async function init() {
   $("country").value = p.wifi_country || guessCountry();
   $("hostname").value = p.hostname || "";
   $("timezone").value = p.timezone || "";
+  $("ssh-key").value = p.ssh_authorized_key || "";
   if (!$("timezone").value) {
     try { $("timezone").placeholder = Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Berlin"; } catch (_) { /* ignore */ }
   }

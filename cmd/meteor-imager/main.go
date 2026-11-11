@@ -249,20 +249,23 @@ func runListDevices(ctx context.Context, args []string) error {
 // which other users can see in the process list.
 type profileFlags struct {
 	file, ssid, country, domain, hostname, timezone *string
+	deviceName, sshKeyFile                          *string
 	hidden, noWiFi, noEnroll                        *bool
 }
 
 func addProfileFlags(fs *flag.FlagSet) profileFlags {
 	return profileFlags{
-		file:     fs.String("profile", "", "FlashProfile JSON file (see \"meteor-imager profile\")"),
-		ssid:     fs.String("wifi-ssid", "", "Wi-Fi network name; password from METEOR_WIFI_PSK or a prompt"),
-		country:  fs.String("wifi-country", "", "Wi-Fi country code, e.g. DE"),
-		hidden:   fs.Bool("wifi-hidden", false, "the Wi-Fi network is hidden"),
-		domain:   fs.String("meteor-domain", "", "MeteorCloud address the Pi reaches (METEOR_DOMAIN); key from METEOR_API_KEY or a prompt"),
-		hostname: fs.String("hostname", "", "hostname for the Pi"),
-		timezone: fs.String("timezone", "", "IANA timezone, e.g. Europe/Berlin"),
-		noWiFi:   fs.Bool("no-wifi", false, "do not set up Wi-Fi"),
-		noEnroll: fs.Bool("no-enrollment", false, "do not write MeteorCloud enrollment"),
+		file:       fs.String("profile", "", "FlashProfile JSON file (see \"meteor-imager profile\")"),
+		ssid:       fs.String("wifi-ssid", "", "Wi-Fi network name; password from METEOR_WIFI_PSK or a prompt"),
+		country:    fs.String("wifi-country", "", "Wi-Fi country code, e.g. DE"),
+		hidden:     fs.Bool("wifi-hidden", false, "the Wi-Fi network is hidden"),
+		domain:     fs.String("meteor-domain", "", "MeteorCloud address the Pi reaches (METEOR_DOMAIN); key from METEOR_API_KEY or a prompt"),
+		hostname:   fs.String("hostname", "", "hostname for the Pi"),
+		timezone:   fs.String("timezone", "", "IANA timezone, e.g. Europe/Berlin"),
+		deviceName: fs.String("device-name", "", "name the device asks for in MeteorCloud (default: its hostname)"),
+		sshKeyFile: fs.String("ssh-key-file", "", "OpenSSH public key file (e.g. ~/.ssh/id_ed25519.pub) for the image's login user; Meteor base images only"),
+		noWiFi:     fs.Bool("no-wifi", false, "do not set up Wi-Fi"),
+		noEnroll:   fs.Bool("no-enrollment", false, "do not write MeteorCloud enrollment"),
 	}
 }
 
@@ -300,13 +303,33 @@ func (pf profileFlags) build() (*profile.FlashProfile, error) {
 	if *pf.timezone != "" {
 		p.Timezone = pf.timezone
 	}
+	if *pf.deviceName != "" {
+		if p.Enrollment == nil {
+			return nil, errors.New("--device-name needs --meteor-domain (enrollment)")
+		}
+		p.Enrollment.DeviceName = *pf.deviceName
+	}
+	if *pf.sshKeyFile != "" {
+		data, err := os.ReadFile(*pf.sshKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		key := strings.TrimSpace(string(data))
+		if strings.Contains(key, "PRIVATE KEY") {
+			return nil, errors.New("--ssh-key-file must be the public key (.pub), not the private key")
+		}
+		p.SSH = &profile.SSH{AuthorizedKeys: []string{key}}
+	}
+	if p.SSH != nil || (p.Enrollment != nil && p.Enrollment.DeviceName != "") {
+		p.SchemaVersion = profile.SchemaVersion
+	}
 	if *pf.noWiFi {
 		p.WiFi = nil
 	}
 	if *pf.noEnroll {
 		p.Enrollment = nil
 	}
-	if p.WiFi == nil && p.Enrollment == nil && p.Hostname == nil && p.Timezone == nil {
+	if p.WiFi == nil && p.Enrollment == nil && p.Hostname == nil && p.Timezone == nil && p.SSHKey() == "" {
 		return nil, nil
 	}
 	return p, p.Validate()

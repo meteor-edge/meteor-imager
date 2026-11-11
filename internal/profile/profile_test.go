@@ -29,7 +29,7 @@ func TestParseValid(t *testing.T) {
 func TestParseRejects(t *testing.T) {
 	for name, in := range map[string]string{
 		"unknown field":  `{"schema_version":1,"surprise":true}`,
-		"newer schema":   `{"schema_version":2}`,
+		"newer schema":   `{"schema_version":3}`,
 		"missing schema": `{"hostname":"x"}`,
 	} {
 		if _, err := Parse(strings.NewReader(in)); err == nil {
@@ -120,5 +120,50 @@ func TestPrefsNeverHoldSecrets(t *testing.T) {
 	}
 	if got := LoadPrefs(); got.WiFiSSID != "" {
 		t.Error("prefs not removed")
+	}
+}
+
+const testSSHKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnlyForTests user@laptop"
+
+func TestV2DeviceNameAndSSHKey(t *testing.T) {
+	in := `{
+  "schema_version": 2,
+  "enrollment": {"meteor_domain": "fleet.example.com", "meteor_api_key": "key_abcdef", "device_name": "Lab Pi 01"},
+  "ssh": {"authorized_keys": ["` + testSSHKey + `"], "user": "pi"},
+  "hostname": null,
+  "timezone": null
+}`
+	p, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if p.SSHKey() != testSSHKey || p.Enrollment.DeviceName != "Lab Pi 01" {
+		t.Errorf("got %+v", p)
+	}
+	// An SSH key alone is something to write.
+	only := &FlashProfile{SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey}}}
+	if err := only.Validate(); err != nil {
+		t.Errorf("ssh only: %v", err)
+	}
+}
+
+func TestV2FieldsAreRejectedInV1AndChecked(t *testing.T) {
+	enabled := true
+	for name, p := range map[string]*FlashProfile{
+		"device name in v1": {SchemaVersion: 1, Enrollment: &Enrollment{MeteorDomain: "x.example.com", MeteorAPIKey: "key_abcdef", DeviceName: "a"}},
+		"ssh in v1":         {SchemaVersion: 1, SSH: &SSH{AuthorizedKeys: []string{testSSHKey}}},
+		"not a key":         {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{"hello world"}}},
+		"key with newline":  {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey + "\nssh-rsa AAAA x"}}},
+		"two keys":          {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey, testSSHKey}}},
+		"enabled reserved":  {SchemaVersion: 2, SSH: &SSH{Enabled: &enabled, AuthorizedKeys: []string{testSSHKey}}},
+		"bad user":          {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey}, User: "Root User"}},
+		"name with newline": {SchemaVersion: 2, Enrollment: &Enrollment{MeteorDomain: "x.example.com", MeteorAPIKey: "key_abcdef", DeviceName: "a\nMETEOR_API_KEY=x"}},
+	} {
+		if err := p.Validate(); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }

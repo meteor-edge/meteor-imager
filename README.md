@@ -98,6 +98,14 @@ Device paths: `/dev/sdX` or `/dev/mmcblkN` on Linux, `/dev/diskN` on macOS, and
 
 Only the FAT boot partition is changed. The root filesystem is written exactly as it is in the image.
 
+**Meteor base images** (MeteorCloud first boot preinstalled; they carry `.meteor-settings`) get a
+single `.meteorenv` with every setting: domain, key, device name, hostname, timezone, Wi-Fi and an
+optional SSH key. The image applies it before the network starts, deletes it from the card and
+sends one token request. A FAT partition labelled `METEORCFG` is used instead of the boot
+partition when the image has one (Jetson, NUC and other device types).
+
+Stock Raspberry Pi OS images get the files below.
+
 | File | When | Contents |
 |---|---|---|
 | `.meteorenv` | Enrollment set | `METEOR_DOMAIN` and `METEOR_API_KEY`. Deleted by `meteor-firstrun.sh` once the token request is sent |

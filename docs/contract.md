@@ -4,7 +4,7 @@ This document is the interface between Meteor Imager, MeteorCloud and the Raspbe
 boot. It covers three things: the FlashProfile settings format, the files written to the card's
 boot partition, and the MeteorCloud API the imager calls.
 
-## 1. FlashProfile (JSON, `schema_version: 1`)
+## 1. FlashProfile (JSON, `schema_version: 2`)
 
 ```json
 {
@@ -17,7 +17,11 @@ boot partition, and the MeteorCloud API the imager calls.
   },
   "enrollment": {
     "meteor_domain": "fleet.example.com",
-    "meteor_api_key": "key_..."
+    "meteor_api_key": "key_...",
+    "device_name": "Lab Pi 01"
+  },
+  "ssh": {
+    "authorized_keys": ["ssh-ed25519 AAAA... you@laptop"]
   },
   "hostname": "pi-01",
   "timezone": "Europe/Berlin"
@@ -26,7 +30,7 @@ boot partition, and the MeteorCloud API the imager calls.
 
 | Field | Required | Rules |
 |---|---|---|
-| `schema_version` | yes | `1`. A newer version is rejected with "update Meteor Imager". |
+| `schema_version` | yes | `2` (version `1` files still load; they cannot use `device_name` or `ssh`). A newer version is rejected with "update Meteor Imager". |
 | `wifi` | no | Omit for wired-only devices. |
 | `wifi.ssid` | with `wifi` | 1–32 bytes. |
 | `wifi.psk` | with `wifi` | 8–63 characters (WPA2/WPA3 personal). No line breaks. |
@@ -37,7 +41,10 @@ boot partition, and the MeteorCloud API the imager calls.
 | `enrollment.meteor_api_key` | with `enrollment` | A MeteorCloud enrollment key, starting with `key_`. |
 | `hostname` | no | `null` or 1–63 characters: `a-z`, `0-9`, `-`. |
 | `timezone` | no | `null` or an IANA name. |
-| `ssh` | no | Reserved; must be absent or empty in v1. |
+| `enrollment.device_name` | no | v2. Name the device asks for in MeteorCloud, 1–63 characters, no line breaks. Default: the hostname. |
+| `ssh.authorized_keys` | no | v2. One OpenSSH public key for the image's login user. Applied by Meteor base images only. |
+| `ssh.user` | no | v2. User that gets the key. Default: the image's first login user. |
+| `ssh.enabled` | no | Reserved; must be absent. |
 | `extras` | no | Reserved; must be absent or empty in v1. |
 
 Unknown fields are rejected, so a typo never silently does nothing. At least one of `wifi`,
@@ -53,9 +60,39 @@ flag, country, hostname and timezone.
 
 ## 2. Boot partition files
 
-Meteor Imager finds the first FAT partition (MBR types `01 04 06 0b 0c 0e ef`, or the GPT basic
-data / EFI system partition types). It edits files in that partition's root directory with a
-userspace FAT driver. Nothing outside that partition is changed.
+Meteor Imager picks the config partition among the FAT partitions (MBR types `01 04 06 0b 0c 0e ef`,
+or the GPT basic data / EFI system partition types): one labelled `METEORCFG` if the image has it
+(device types without a FAT boot partition, such as Jetson or NUC base images), otherwise the first
+one (the Raspberry Pi boot partition, or the EFI system partition). It edits files in that
+partition's root directory with a userspace FAT driver. Nothing outside that partition is changed.
+
+### Meteor base images (`.meteor-settings` on the config partition)
+
+Base images with MeteorCloud first boot preinstalled (meteor-cloud's
+`install-meteorcli-firstboot.sh`) carry `.meteor-settings` on the config partition. For them,
+Meteor Imager writes **only** `.meteorenv` (version 2, below) and leaves `user-data`,
+`network-config`, `meta-data` and `cmdline.txt` alone. The image's `meteorcli-settings.service`
+applies everything early in boot (Wi-Fi through NetworkManager, hostname, timezone, SSH key),
+moves the enrollment values to `/etc/meteorcli-firstboot.env` (root only) and deletes `.meteorenv`
+from the card before the network starts. `meteorcli-firstboot.service` then sends one token request.
+
+```
+METEOR_ENV_VERSION=2
+METEOR_DOMAIN=fleet.example.com
+METEOR_API_KEY=key_...
+METEOR_NAME=Lab Pi 01
+METEOR_HOSTNAME=pi-01
+METEOR_TIMEZONE=Europe/Berlin
+METEOR_WIFI_SSID=MyNetwork
+METEOR_WIFI_PSK=wifi-password
+METEOR_WIFI_COUNTRY=DE
+METEOR_WIFI_HIDDEN=false
+METEOR_SSH_AUTHORIZED_KEY=ssh-ed25519 AAAA... you@laptop
+METEOR_SSH_USER=pi
+```
+
+Lines are present only for the settings that are set. The value runs to the end of the line
+(no quoting); validated profiles never contain line breaks.
 
 ### `.meteorenv` (enrollment set)
 
@@ -64,8 +101,9 @@ METEOR_DOMAIN=fleet.example.com
 METEOR_API_KEY=key_...
 ```
 
-`KEY=value` lines, no quoting, LF line endings. `meteor-firstrun.sh` reads it (the file is
-parsed, never sourced) and deletes it once the token request is sent. MeteorCloud's own first-boot
+`KEY=value` lines, no quoting, LF line endings, plus `METEOR_NAME=…` when a device name is set.
+`meteor-firstrun.sh` reads it (the file is parsed, never sourced) and deletes it once the token
+request is sent. MeteorCloud's own first-boot
 scripts in golden images read `/boot/firmware/.meteorenv` too (see MeteorCloud's
 `src/device-plane/agent/packaging/firstboot/`).
 
