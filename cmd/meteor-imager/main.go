@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/meteor-edge/meteor-imager/internal/backup"
 	"github.com/meteor-edge/meteor-imager/internal/devices"
 	"github.com/meteor-edge/meteor-imager/internal/flash"
 	"github.com/meteor-edge/meteor-imager/internal/gui"
@@ -44,6 +45,7 @@ Commands:
   list-devices   list cards that can be written
   flash          write an image to a card, verify it, apply a profile, eject
   configure      write a configured copy of an image to a new .img file
+  backup         read a card into an image file (.img or .img.gz), shrunk to its data
   profile        print an example FlashProfile JSON
   version        print the version
 
@@ -72,6 +74,8 @@ func main() {
 		err = runFlash(ctx, args)
 	case "configure":
 		err = runConfigure(ctx, args)
+	case "backup":
+		err = runBackup(ctx, args)
 	case "profile":
 		err = printExampleProfile(os.Stdout)
 	case "version":
@@ -249,20 +253,26 @@ func runListDevices(ctx context.Context, args []string) error {
 // which other users can see in the process list.
 type profileFlags struct {
 	file, ssid, country, domain, hostname, timezone *string
-	hidden, noWiFi, noEnroll                        *bool
+	deviceName, sshKeyFile, user, sshPasswordAuth   *string
+	hidden, noWiFi, noEnroll, ssh                   *bool
 }
 
 func addProfileFlags(fs *flag.FlagSet) profileFlags {
 	return profileFlags{
-		file:     fs.String("profile", "", "FlashProfile JSON file (see \"meteor-imager profile\")"),
-		ssid:     fs.String("wifi-ssid", "", "Wi-Fi network name; password from METEOR_WIFI_PSK or a prompt"),
-		country:  fs.String("wifi-country", "", "Wi-Fi country code, e.g. DE"),
-		hidden:   fs.Bool("wifi-hidden", false, "the Wi-Fi network is hidden"),
-		domain:   fs.String("meteor-domain", "", "MeteorCloud address the Pi reaches (METEOR_DOMAIN); key from METEOR_API_KEY or a prompt"),
-		hostname: fs.String("hostname", "", "hostname for the Pi"),
-		timezone: fs.String("timezone", "", "IANA timezone, e.g. Europe/Berlin"),
-		noWiFi:   fs.Bool("no-wifi", false, "do not set up Wi-Fi"),
-		noEnroll: fs.Bool("no-enrollment", false, "do not write MeteorCloud enrollment"),
+		file:            fs.String("profile", "", "FlashProfile JSON file (see \"meteor-imager profile\")"),
+		ssid:            fs.String("wifi-ssid", "", "Wi-Fi network name; password from METEOR_WIFI_PSK or a prompt"),
+		country:         fs.String("wifi-country", "", "Wi-Fi country code, e.g. DE"),
+		hidden:          fs.Bool("wifi-hidden", false, "the Wi-Fi network is hidden"),
+		domain:          fs.String("meteor-domain", "", "MeteorCloud address the Pi reaches (METEOR_DOMAIN); key from METEOR_API_KEY or a prompt"),
+		hostname:        fs.String("hostname", "", "hostname for the Pi"),
+		timezone:        fs.String("timezone", "", "IANA timezone, e.g. Europe/Berlin"),
+		deviceName:      fs.String("device-name", "", "name the device asks for in MeteorCloud (default: its hostname)"),
+		sshKeyFile:      fs.String("ssh-key-file", "", "OpenSSH public key file (e.g. ~/.ssh/id_ed25519.pub) for the login user; turns SSH on"),
+		user:            fs.String("user", "", "login user name (the image's first user is renamed); password from METEOR_USER_PASSWORD or a prompt"),
+		ssh:             fs.Bool("ssh", false, "turn the SSH server on"),
+		sshPasswordAuth: fs.String("ssh-password-auth", "", `"true" to allow SSH password logins, "false" for keys only`),
+		noWiFi:          fs.Bool("no-wifi", false, "do not set up Wi-Fi"),
+		noEnroll:        fs.Bool("no-enrollment", false, "do not write MeteorCloud enrollment"),
 	}
 }
 
@@ -300,16 +310,62 @@ func (pf profileFlags) build() (*profile.FlashProfile, error) {
 	if *pf.timezone != "" {
 		p.Timezone = pf.timezone
 	}
+	if *pf.deviceName != "" {
+		if p.Enrollment == nil {
+			return nil, errors.New("--device-name needs --meteor-domain (enrollment)")
+		}
+		p.Enrollment.DeviceName = *pf.deviceName
+	}
+	if *pf.sshKeyFile != "" {
+		data, err := os.ReadFile(*pf.sshKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		key := strings.TrimSpace(string(data))
+		if strings.Contains(key, "PRIVATE KEY") {
+			return nil, errors.New("--ssh-key-file must be the public key (.pub), not the private key")
+		}
+		ssh(p).AuthorizedKeys = []string{key}
+	}
+	if *pf.user != "" {
+		pw, err := secret("METEOR_USER_PASSWORD", "Password for "+*pf.user+" (empty: keep the image's)")
+		if err != nil {
+			return nil, err
+		}
+		p.User = &profile.User{Name: *pf.user, Password: pw}
+	}
+	if *pf.ssh {
+		on := true
+		ssh(p).Enabled = &on
+	}
+	switch *pf.sshPasswordAuth {
+	case "":
+	case "true", "false":
+		allow := *pf.sshPasswordAuth == "true"
+		ssh(p).PasswordAuthentication = &allow
+	default:
+		return nil, errors.New(`--ssh-password-auth must be "true" or "false"`)
+	}
+	if p.SSH != nil || p.User != nil || (p.Enrollment != nil && p.Enrollment.DeviceName != "") {
+		p.SchemaVersion = profile.SchemaVersion
+	}
 	if *pf.noWiFi {
 		p.WiFi = nil
 	}
 	if *pf.noEnroll {
 		p.Enrollment = nil
 	}
-	if p.WiFi == nil && p.Enrollment == nil && p.Hostname == nil && p.Timezone == nil {
+	if p.Empty() {
 		return nil, nil
 	}
 	return p, p.Validate()
+}
+
+func ssh(p *profile.FlashProfile) *profile.SSH {
+	if p.SSH == nil {
+		p.SSH = &profile.SSH{}
+	}
+	return p.SSH
 }
 
 func secret(env, prompt string) (string, error) {
@@ -479,6 +535,67 @@ func runConfigure(ctx context.Context, args []string) error {
 	return nil
 }
 
+func runBackup(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	device := fs.String("device", "", "card to read, e.g. /dev/sdb, /dev/disk4, \\\\.\\PhysicalDrive2 (see list-devices)")
+	out := fs.String("out", "", "new image file: name.img, or name.img.gz (compressed)")
+	noShrink := fs.Bool("no-shrink", false, "keep the root partition at its full size")
+	noEject := fs.Bool("no-eject", false, "leave the card connected")
+	nonRemovable := fs.Bool("allow-non-removable", false, "allow a disk that is not marked removable (never a system disk)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *device == "" || *out == "" {
+		return errors.New("--device and --out are required")
+	}
+	if err := backup.CheckOutput(*out); err != nil {
+		return err
+	}
+	if ok, why := flash.CanWriteDevices(); !ok {
+		return errors.New(why)
+	}
+	if !*noShrink && !backup.ShrinkAvailable() {
+		fmt.Fprintln(os.Stderr, "Note: e2fsprogs (e2fsck, resize2fs) is not installed, so the image is not shrunk.")
+	}
+	d, err := devices.Find(ctx, *device)
+	if err != nil {
+		return err
+	}
+	bars := map[string]*bar{}
+	rep, err := job.Backup(ctx, job.BackupRequest{
+		Device: d, Out: *out, Shrink: !*noShrink, AllowNonRemovable: *nonRemovable, NoEject: *noEject,
+	}, func(e job.Event) {
+		if e.Message != "" && e.Stage != job.StageOpen {
+			fmt.Fprintln(os.Stderr, e.Message)
+		}
+		switch e.Stage {
+		case backup.StageRead, backup.StageSave:
+			b := bars[e.Stage]
+			if b == nil {
+				b = newBar(e.Stage)
+				bars[e.Stage] = b
+			}
+			b.set(e.Fraction)
+		case backup.StageShrink:
+			if e.Fraction == 0 {
+				fmt.Fprintln(os.Stderr, "Shrinking the root filesystem…")
+			}
+		}
+	})
+	for _, b := range bars {
+		b.done()
+	}
+	if err != nil {
+		return err
+	}
+	for _, n := range rep.Notes {
+		fmt.Fprintln(os.Stderr, "Note:", n)
+	}
+	fmt.Fprintf(os.Stderr, "Saved %s (%s, image %s%s)\nSHA-256 %s\n", rep.Path,
+		devices.HumanSize(rep.FileBytes), devices.HumanSize(rep.ImageBytes), map[bool]string{true: ", shrunk"}[rep.Shrunk], rep.SHA256)
+	return nil
+}
+
 func printReport(rep *flash.Report) {
 	fmt.Fprintf(os.Stderr, "Wrote %s", devices.HumanSize(rep.BytesWritten))
 	if rep.Verified {
@@ -497,11 +614,14 @@ func printReport(rep *flash.Report) {
 
 func printExampleProfile(w io.Writer) error {
 	host, tz := "pi-01", "Europe/Berlin"
+	on, off := true, false
 	return writeJSON(w, profile.FlashProfile{
 		SchemaVersion: profile.SchemaVersion,
 		WiFi:          &profile.WiFi{SSID: "MyNetwork", PSK: "wifi-password", Country: "DE"},
 		Enrollment:    &profile.Enrollment{MeteorDomain: "fleet.example.com", MeteorAPIKey: "key_..."},
 		Hostname:      &host,
+		User:          &profile.User{Name: "pi", Password: "login-password"},
+		SSH:           &profile.SSH{Enabled: &on, PasswordAuthentication: &off, AuthorizedKeys: []string{"ssh-ed25519 AAAA... you@laptop"}},
 		Timezone:      &tz,
 	})
 }

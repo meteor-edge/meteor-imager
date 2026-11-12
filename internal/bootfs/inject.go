@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/meteor-edge/meteor-imager/internal/profile"
+	"github.com/meteor-edge/meteor-imager/internal/shacrypt"
 )
 
 // Files on the boot partition that Meteor Imager writes.
@@ -22,6 +23,15 @@ const (
 	CmdlineFile       = "cmdline.txt"
 	WPASupplicantFile = "wpa_supplicant.conf"
 	FirstrunFile      = "meteor-firstrun.sh"
+	// UserconfFile and SSHFile are the legacy Raspberry Pi OS first-boot files
+	// (images without cloud-init): "name:crypt-hash" and an empty file that
+	// turns SSH on.
+	UserconfFile = "userconf.txt"
+	SSHFile      = "ssh"
+	// BaseImageMarker is on the config partition of Meteor base images (MeteorCloud
+	// first boot preinstalled, see meteor-cloud's install-meteorcli-firstboot.sh).
+	// Those images apply .meteorenv v2 themselves: Wi-Fi, hostname, timezone, user, SSH.
+	BaseImageMarker = ".meteor-settings"
 )
 
 // FirstrunScript asks MeteorCloud for a device token on first boot, then removes
@@ -38,6 +48,9 @@ type Result struct {
 	// Bookworm 2024-11): Wi-Fi then goes to wpa_supplicant.conf, and enrollment
 	// needs MeteorCloud first boot installed in the image.
 	CloudInit bool `json:"cloud_init"`
+	// BaseImage is true for Meteor base images: everything went into .meteorenv,
+	// and cloud-init files were left alone.
+	BaseImage bool `json:"base_image,omitempty"`
 }
 
 // Options tune injection; the zero value is right for normal use.
@@ -56,7 +69,8 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 	if opt.Now != nil {
 		now = opt.Now
 	}
-	res := &Result{CloudInit: v.Exists(UserDataFile)}
+	res := &Result{CloudInit: v.Exists(UserDataFile), BaseImage: v.Exists(BaseImageMarker)}
+	warn := func(msg string) { res.Warnings = append(res.Warnings, msg) }
 
 	write := func(name string, data []byte) error {
 		if err := v.WriteFile(name, data); err != nil {
@@ -64,6 +78,27 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 		}
 		res.Written = append(res.Written, name)
 		return nil
+	}
+
+	passwordHash := ""
+	if p.User != nil && p.User.Password != "" {
+		h, err := shacrypt.Hash(p.User.Password)
+		if err != nil {
+			return nil, fmt.Errorf("hash the password: %w", err)
+		}
+		passwordHash = h
+	}
+
+	if res.BaseImage {
+		// The image's meteorcli-settings.service applies every setting early in
+		// boot and deletes .meteorenv; cloud-init must not run a second enrollment.
+		if p.Enrollment == nil {
+			warn("No enrollment key: the device will not join MeteorCloud by itself.")
+		}
+		if err := write(MeteorEnvFile, MeteorEnvV2(p, passwordHash)); err != nil {
+			return nil, err
+		}
+		return res, nil
 	}
 
 	if p.Enrollment != nil {
@@ -79,25 +114,48 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 
 	if !res.CloudInit {
 		if p.Hostname != nil || p.Timezone != nil {
-			res.Warnings = append(res.Warnings, "Hostname and timezone need cloud-init; this image has none, so they were not set.")
+			warn("Hostname and timezone need cloud-init; this image has none, so they were not set.")
 		}
 		if p.WiFi != nil {
 			if err := write(WPASupplicantFile, WPASupplicant(p.WiFi)); err != nil {
 				return nil, err
 			}
 		}
+		if p.User != nil {
+			if passwordHash == "" {
+				warn("On images without cloud-init the user needs a password; the user was not set.")
+			} else if err := write(UserconfFile, []byte(p.User.Name+":"+passwordHash+"\n")); err != nil {
+				return nil, err
+			}
+		}
+		if on := p.SSHEnabled(); on != nil && *on {
+			if err := write(SSHFile, nil); err != nil {
+				return nil, err
+			}
+		} else if on != nil {
+			warn("This image has no cloud-init; SSH cannot be turned off from the card (it is off unless the image enabled it).")
+		}
+		if p.SSHKey() != "" {
+			warn("This image has no cloud-init, so the SSH key was not written; log in with the password.")
+		}
+		if p.SSH != nil && p.SSH.PasswordAuthentication != nil && !*p.SSH.PasswordAuthentication {
+			warn("This image has no cloud-init, so password logins stay allowed.")
+		}
 		return res, nil
 	}
 
-	if p.Enrollment == nil && p.WiFi == nil && p.Hostname == nil && p.Timezone == nil {
+	if p.Empty() {
 		return res, nil
+	}
+	if p.SSHKey() != "" && p.User == nil {
+		warn("No user set: the SSH key goes to the image's default cloud-init user, which some images do not have. Set a user too.")
 	}
 
 	existing, err := v.ReadFile(UserDataFile)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", UserDataFile, err)
 	}
-	userData, err := MergeUserData(existing, p)
+	userData, err := MergeUserData(existing, p, passwordHash)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +206,61 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 
 // MeteorEnv is the .meteorenv file MeteorCloud first boot reads (KEY=value lines).
 func MeteorEnv(e *profile.Enrollment) []byte {
-	return []byte("METEOR_DOMAIN=" + e.MeteorDomain + "\nMETEOR_API_KEY=" + e.MeteorAPIKey + "\n")
+	s := "METEOR_DOMAIN=" + e.MeteorDomain + "\nMETEOR_API_KEY=" + e.MeteorAPIKey + "\n"
+	if e.DeviceName != "" {
+		s += "METEOR_NAME=" + e.DeviceName + "\n"
+	}
+	return []byte(s)
+}
+
+// MeteorEnvV2 is .meteorenv for Meteor base images: enrollment plus every other
+// setting, applied by meteorcli-settings.service. KEY=value lines, value to the end
+// of the line (validated profiles hold no line breaks). The user password is
+// written only as passwordHash.
+func MeteorEnvV2(p *profile.FlashProfile, passwordHash string) []byte {
+	var b strings.Builder
+	kv := func(k, v string) { b.WriteString(k + "=" + v + "\n") }
+	kv("METEOR_ENV_VERSION", "2")
+	if e := p.Enrollment; e != nil {
+		kv("METEOR_DOMAIN", e.MeteorDomain)
+		kv("METEOR_API_KEY", e.MeteorAPIKey)
+		if e.DeviceName != "" {
+			kv("METEOR_NAME", e.DeviceName)
+		}
+	}
+	if p.Hostname != nil {
+		kv("METEOR_HOSTNAME", *p.Hostname)
+	}
+	if p.Timezone != nil {
+		kv("METEOR_TIMEZONE", *p.Timezone)
+	}
+	if w := p.WiFi; w != nil {
+		kv("METEOR_WIFI_SSID", w.SSID)
+		kv("METEOR_WIFI_PSK", w.PSK)
+		kv("METEOR_WIFI_COUNTRY", w.Country)
+		kv("METEOR_WIFI_HIDDEN", fmt.Sprint(w.Hidden))
+	}
+	if u := p.User; u != nil {
+		kv("METEOR_USER", u.Name)
+		if passwordHash != "" {
+			kv("METEOR_USER_PASSWORD_HASH", passwordHash)
+		}
+	}
+	if s := p.SSH; s != nil {
+		if s.Enabled != nil {
+			kv("METEOR_SSH_ENABLED", fmt.Sprint(*s.Enabled))
+		}
+		if s.PasswordAuthentication != nil {
+			kv("METEOR_SSH_PASSWORD_AUTH", fmt.Sprint(*s.PasswordAuthentication))
+		}
+	}
+	if k := p.SSHKey(); k != "" {
+		kv("METEOR_SSH_AUTHORIZED_KEY", k)
+		if p.SSH.User != "" {
+			kv("METEOR_SSH_USER", p.SSH.User)
+		}
+	}
+	return []byte(b.String())
 }
 
 // withDatasource sets "ds=nocloud;i=<id>" on the single cmdline.txt line,

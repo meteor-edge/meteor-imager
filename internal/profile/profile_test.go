@@ -29,7 +29,7 @@ func TestParseValid(t *testing.T) {
 func TestParseRejects(t *testing.T) {
 	for name, in := range map[string]string{
 		"unknown field":  `{"schema_version":1,"surprise":true}`,
-		"newer schema":   `{"schema_version":2}`,
+		"newer schema":   `{"schema_version":4}`,
 		"missing schema": `{"hostname":"x"}`,
 	} {
 		if _, err := Parse(strings.NewReader(in)); err == nil {
@@ -120,5 +120,107 @@ func TestPrefsNeverHoldSecrets(t *testing.T) {
 	}
 	if got := LoadPrefs(); got.WiFiSSID != "" {
 		t.Error("prefs not removed")
+	}
+}
+
+const testSSHKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnlyForTests user@laptop"
+
+func TestV2DeviceNameAndSSHKey(t *testing.T) {
+	in := `{
+  "schema_version": 2,
+  "enrollment": {"meteor_domain": "fleet.example.com", "meteor_api_key": "key_abcdef", "device_name": "Lab Pi 01"},
+  "ssh": {"authorized_keys": ["` + testSSHKey + `"], "user": "pi"},
+  "hostname": null,
+  "timezone": null
+}`
+	p, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if p.SSHKey() != testSSHKey || p.Enrollment.DeviceName != "Lab Pi 01" {
+		t.Errorf("got %+v", p)
+	}
+	// An SSH key alone is something to write.
+	only := &FlashProfile{SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey}}}
+	if err := only.Validate(); err != nil {
+		t.Errorf("ssh only: %v", err)
+	}
+}
+
+func TestV2FieldsAreRejectedInV1AndChecked(t *testing.T) {
+	enabled := true
+	for name, p := range map[string]*FlashProfile{
+		"device name in v1": {SchemaVersion: 1, Enrollment: &Enrollment{MeteorDomain: "x.example.com", MeteorAPIKey: "key_abcdef", DeviceName: "a"}},
+		"ssh in v1":         {SchemaVersion: 1, SSH: &SSH{AuthorizedKeys: []string{testSSHKey}}},
+		"not a key":         {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{"hello world"}}},
+		"key with newline":  {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey + "\nssh-rsa AAAA x"}}},
+		"two keys":          {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey, testSSHKey}}},
+		"enabled in v2":     {SchemaVersion: 2, SSH: &SSH{Enabled: &enabled, AuthorizedKeys: []string{testSSHKey}}},
+		"bad user":          {SchemaVersion: 2, SSH: &SSH{AuthorizedKeys: []string{testSSHKey}, User: "Root User"}},
+		"name with newline": {SchemaVersion: 2, Enrollment: &Enrollment{MeteorDomain: "x.example.com", MeteorAPIKey: "key_abcdef", DeviceName: "a\nMETEOR_API_KEY=x"}},
+	} {
+		if err := p.Validate(); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
+func TestV3UserAndSSH(t *testing.T) {
+	in := `{
+  "schema_version": 3,
+  "user": {"name": "ops", "password": "s3cret pass"},
+  "ssh": {"enabled": true, "password_authentication": false},
+  "hostname": null,
+  "timezone": null
+}`
+	p, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if on := p.SSHEnabled(); on == nil || !*on || p.SSHKeyUser() != "ops" {
+		t.Errorf("SSHEnabled = %v, SSHKeyUser = %q", on, p.SSHKeyUser())
+	}
+	b, _ := json.Marshal(p.Redacted())
+	if strings.Contains(string(b), "s3cret") {
+		t.Errorf("redacted copy has the password: %s", b)
+	}
+	if prefs := PrefsFrom("", p); prefs.UserName != "ops" || prefs.SSHEnabled == nil || !*prefs.SSHEnabled ||
+		prefs.SSHPassword == nil || *prefs.SSHPassword {
+		t.Errorf("prefs = %+v", prefs)
+	}
+	// A card without SSH settings means the SSH box was unticked.
+	noSSH := &FlashProfile{SchemaVersion: 3, User: p.User}
+	if prefs := PrefsFrom("", noSSH); prefs.SSHEnabled == nil || *prefs.SSHEnabled || prefs.SSHPassword != nil {
+		t.Errorf("prefs without ssh = %+v", prefs)
+	}
+	p.Clear()
+	if p.User.Password != "" {
+		t.Error("Clear left the password")
+	}
+
+	// A key alone turns SSH on; nothing at all leaves it alone.
+	keyOnly := &FlashProfile{SchemaVersion: 3, SSH: &SSH{AuthorizedKeys: []string{testSSHKey}}}
+	if on := keyOnly.SSHEnabled(); on == nil || !*on {
+		t.Error("a key does not turn SSH on")
+	}
+	if (&FlashProfile{SchemaVersion: 3, Hostname: p.Hostname}).SSHEnabled() != nil {
+		t.Error("SSH state set without SSH settings")
+	}
+
+	for name, bad := range map[string]*FlashProfile{
+		"user in v2":         {SchemaVersion: 2, User: &User{Name: "ops", Password: "x"}},
+		"root":               {SchemaVersion: 3, User: &User{Name: "root", Password: "x"}},
+		"capitals":           {SchemaVersion: 3, User: &User{Name: "Ops", Password: "x"}},
+		"password linebreak": {SchemaVersion: 3, User: &User{Name: "ops", Password: "a\nb"}},
+	} {
+		if err := bad.Validate(); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }

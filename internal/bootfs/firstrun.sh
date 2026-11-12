@@ -33,6 +33,7 @@ main() {
 	INSTALL_URL="${METEOR_INSTALL_URL:-https://github.com/meteor-edge/meteor-cloud/releases/latest/download/install-meteorcli.sh}"
 	RETRIES="${METEOR_RETRIES:-60}"
 	RETRY_SECONDS="${METEOR_RETRY_SECONDS:-10}"
+	FIRSTBOOT_UNIT="${METEOR_FIRSTBOOT_UNIT:-/etc/systemd/system/meteorcli-firstboot.service}"
 
 	if [[ "${EUID}" -ne 0 && -z "${METEOR_FIRSTRUN_ALLOW_NONROOT:-}" ]]; then
 		echo "meteor-firstrun: run as root: sudo bash $0" >&2
@@ -52,6 +53,14 @@ main() {
 		log "A token request was already sent; resuming."
 		remove_firstrun
 		start_agent
+		return 0
+	fi
+
+	# A Meteor base image enrolls with its own meteorcli-firstboot.service, which
+	# reads .meteorenv too. Two runs would race, so leave enrollment to it.
+	if [[ -f "${FIRSTBOOT_UNIT}" ]]; then
+		log "This image has MeteorCloud first boot (${FIRSTBOOT_UNIT}); it enrolls the device."
+		rm -f "${SELF}"
 		return 0
 	fi
 

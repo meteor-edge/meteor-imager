@@ -39,8 +39,13 @@ Record the version, OS version, card reader and card for each run.
 - [ ] The domain is pre-filled from the server address and can be edited.
 - [ ] A missing key, a short Wi-Fi password or a missing country is shown inline, and you cannot continue.
 - [ ] **Show** reveals the password and key; the browser does not offer to save them.
-- [ ] With **Remember** ticked, the next start pre-fills domain, SSID, country, hostname and
-      timezone, but **not** the password or key. **Forget saved settings** clears them.
+- [ ] **General** and **MeteorCloud** tabs switch; a problem on the other tab opens that tab.
+- [ ] Username with capitals or `root`, an empty user password, or "public key only" without a key
+      is shown inline.
+- [ ] On a fresh start (no saved settings) **Enable SSH** is ticked with password authentication.
+- [ ] With **Remember** ticked, the next start pre-fills domain, SSID, country, hostname, timezone,
+      username and SSH choices (including SSH unticked), but **not** the passwords or key.
+      **Forget saved settings** clears them.
 - [ ] Check the prefs file (`~/.config/meteor-imager/prefs.json`, `~/Library/Application Support/…`,
       `%AppData%\meteor-imager\…`): no secrets, mode 0600 on Unix.
 
@@ -64,6 +69,7 @@ Record the version, OS version, card reader and card for each run.
 - [ ] Unplugging the card during Write gives an error and does not crash.
 - [ ] A card smaller than the image is refused ("larger than the card").
 - [ ] After **Done**, the card is ejected (Windows: safe to remove).
+- [ ] With a user and SSH password login, **Done** shows the login command (`ssh <user>@<hostname>.local`).
 - [ ] **Write another card** goes back to the card step with settings kept.
 
 ### Card contents (mount the boot partition on a PC)
@@ -84,12 +90,33 @@ Record the version, OS version, card reader and card for each run.
 - [ ] Rewriting the same card with different Wi-Fi works (new instance-id).
 - [ ] Hidden SSID: the Pi joins.
 - [ ] Wired only (Wi-Fi unticked): the Pi enrolls over Ethernet.
+- [ ] User and password set: you can log in on the console and over SSH (password auth) as that
+      user; the image's default user no longer exists. With "public key only", password SSH is
+      refused and the key works.
+- [ ] The card's boot partition never contains the user password in plain text.
+
+### Golden image (prepare, back up, write)
+
+- [ ] Plain Raspberry Pi OS Lite → install Docker and `meteorcli` → `sudo meteorcli-prepare-image.sh`
+      → the Pi powers off.
+- [ ] **Back up a card** with e2fsprogs: the file is much smaller than the card and the report says
+      "shrunk"; without e2fsprogs the checkbox is disabled with a hint.
+- [ ] Upload the backup as an OS image, publish it, and write two cards from it with different
+      hostnames, users and Wi-Fi.
+- [ ] Both boot, grow the root filesystem to the card (`df -h /`), have different SSH host keys and
+      `/etc/machine-id`, Docker works, and both appear in MeteorCloud as pending enrollments.
+- [ ] **Cancel** during a backup leaves no file.
+- [ ] **Write this backup to a card** opens Settings with the backup as the local file; writing it
+      with a user, Wi-Fi and enrollment key gives a card that boots and enrolls.
+- [ ] **Start over** after a write or a backup goes back to the image step with no image, card,
+      passwords or key; saved preferences are filled in again.
 
 ### Legacy image (no cloud-init)
 
 - [ ] The result shows the "no cloud-init" warnings. `wpa_supplicant.conf` has a hex SSID and a
       64-hex `psk`, not the passphrase.
 - [ ] The Pi joins Wi-Fi.
+- [ ] With a user and SSH on: `userconf.txt` and `ssh` are on the card, and you can SSH in as the user.
 
 ## CLI (one Linux and one Windows or macOS machine)
 

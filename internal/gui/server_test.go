@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -97,5 +99,41 @@ func TestFlashValidatesProfileWithoutEchoingSecrets(t *testing.T) {
 	}
 	if w := request(s, "POST", "/api/flash", `{"surprise":1}`, nil); w.Code != http.StatusBadRequest {
 		t.Fatalf("unknown field: %d", w.Code)
+	}
+}
+
+func TestFlashNeverEchoesTheUserPassword(t *testing.T) {
+	s := newServer("127.0.0.1:4321", "test")
+	body := `{"device":"/dev/none","confirm_device":"/dev/none","profile":{"schema_version":3,
+	  "user":{"name":"Root User","password":"user-SECRET"}}}`
+	w := request(s, "POST", "/api/flash", body, nil)
+	if w.Code != http.StatusUnprocessableEntity || strings.Contains(w.Body.String(), "SECRET") {
+		t.Fatalf("got %d %s", w.Code, w.Body)
+	}
+}
+
+func TestBackupChecksTheOutputFirst(t *testing.T) {
+	s := newServer("127.0.0.1:4321", "test")
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "old.img")
+	if err := os.WriteFile(existing, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, out := range map[string]string{
+		"relative":      "backup.img",
+		"wrong suffix":  filepath.Join(dir, "backup.img.xz"),
+		"missing dir":   filepath.Join(dir, "nope", "backup.img"),
+		"existing file": existing,
+	} {
+		body, _ := json.Marshal(map[string]any{"device": "/dev/none", "out": out, "shrink": true})
+		if w := request(s, "POST", "/api/backup", string(body), nil); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d %s", name, w.Code, w.Body)
+		}
+	}
+	w := request(s, "GET", "/api/state", "", nil)
+	var st map[string]any
+	json.Unmarshal(w.Body.Bytes(), &st)
+	if _, ok := st["shrink_available"]; !ok || st["backup_dir"] == nil {
+		t.Errorf("state = %v", st)
 	}
 }

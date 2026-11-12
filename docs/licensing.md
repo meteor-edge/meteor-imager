@@ -16,6 +16,15 @@ licence texts (see `THIRD_PARTY_LICENSES` in release archives).
 
 Release builds use `-tags fat_noexfat`, which leaves soypat/fat's exFAT code out of the binary.
 
+SHA-512 crypt (user password hashes) is implemented in `internal/shacrypt` from the published
+algorithm; no third-party code.
+
+## Tools run but not shipped
+
+| Tool | License | Use |
+|---|---|---|
+| [e2fsprogs](https://e2fsprogs.sourceforge.net/) (`e2fsck`, `resize2fs`, `dumpe2fs`) | GPL-2.0 | Optional. `backup` runs them as separate programs, when the user has installed them, to shrink a copy of the root filesystem. Not linked, bundled or redistributed. |
+
 Before adding a dependency, check its licence (no GPL/LGPL/AGPL or unclear terms) and add it to
 this table. To regenerate the list of linked modules:
 

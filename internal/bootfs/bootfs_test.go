@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/meteor-edge/meteor-imager/internal/diskimage"
 	"github.com/meteor-edge/meteor-imager/internal/profile"
+	"github.com/meteor-edge/meteor-imager/internal/shacrypt"
 )
 
 const (
@@ -395,4 +397,257 @@ func TestInjectAboveCluster65535(t *testing.T) {
 		t.Errorf("%s above cluster 65535 differs from the embedded script", FirstrunFile)
 	}
 	fsck(t, path)
+}
+
+const testSSHKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnlyForTests user@laptop"
+
+func v2Profile() *profile.FlashProfile {
+	p := fullProfile()
+	p.SchemaVersion = 2
+	p.Enrollment.DeviceName = "Kitchen Pi"
+	p.SSH = &profile.SSH{AuthorizedKeys: []string{testSSHKey}, User: "pi"}
+	return p
+}
+
+func TestInjectBaseImageWritesOnlyMeteorenvV2(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{
+		BaseImageMarker: "meteor_settings=2\n",
+		UserDataFile:    stockUserData,
+		CmdlineFile:     stockCmdline,
+	})
+	res := injectInto(t, path, v2Profile())
+
+	if !res.BaseImage || len(res.Written) != 1 || res.Written[0] != MeteorEnvFile {
+		t.Fatalf("result = %+v", res)
+	}
+	want := "METEOR_ENV_VERSION=2\n" +
+		"METEOR_DOMAIN=fleet.example.com\n" +
+		"METEOR_API_KEY=key_abc123\n" +
+		"METEOR_NAME=Kitchen Pi\n" +
+		"METEOR_HOSTNAME=pi-kitchen\n" +
+		"METEOR_TIMEZONE=Europe/Berlin\n" +
+		"METEOR_WIFI_SSID=Cafe \"Wi-Fi\": yes\n" +
+		"METEOR_WIFI_PSK=p#ss: word\n" +
+		"METEOR_WIFI_COUNTRY=DE\n" +
+		"METEOR_WIFI_HIDDEN=false\n" +
+		"METEOR_SSH_AUTHORIZED_KEY=" + testSSHKey + "\n" +
+		"METEOR_SSH_USER=pi\n"
+	if got := readBack(t, path, MeteorEnvFile); got != want {
+		t.Errorf(".meteorenv:\n%s\nwant:\n%s", got, want)
+	}
+	// cloud-init must not run a second enrollment on a base image.
+	if got := readBack(t, path, UserDataFile); got != stockUserData {
+		t.Errorf("user-data changed:\n%s", got)
+	}
+	if got := readBack(t, path, CmdlineFile); got != stockCmdline {
+		t.Errorf("cmdline.txt changed: %q", got)
+	}
+	fsck(t, path)
+}
+
+func TestInjectStockImageGivesTheSSHKeyToCloudInit(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData, CmdlineFile: stockCmdline})
+	res := injectInto(t, path, v2Profile())
+
+	if res.BaseImage || !res.CloudInit {
+		t.Fatalf("result = %+v", res)
+	}
+	env := readBack(t, path, MeteorEnvFile)
+	if env != "METEOR_DOMAIN=fleet.example.com\nMETEOR_API_KEY=key_abc123\nMETEOR_NAME=Kitchen Pi\n" {
+		t.Errorf(".meteorenv = %q", env)
+	}
+	var ud struct {
+		Keys   []string `yaml:"ssh_authorized_keys"`
+		RunCmd []string `yaml:"runcmd"`
+	}
+	if err := yaml.Unmarshal([]byte(readBack(t, path, UserDataFile)), &ud); err != nil {
+		t.Fatal(err)
+	}
+	if len(ud.Keys) != 1 || ud.Keys[0] != testSSHKey || !slices.Contains(ud.RunCmd, sshEnableCommand) {
+		t.Errorf("user-data = %+v", ud)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, " "), "No user set") {
+		t.Errorf("warnings = %v", res.Warnings)
+	}
+}
+
+const testPassword = "correct horse battery"
+
+func v3Profile() *profile.FlashProfile {
+	p := v2Profile()
+	p.SchemaVersion = 3
+	on, off := true, false
+	p.User = &profile.User{Name: "ops", Password: testPassword}
+	p.SSH = &profile.SSH{Enabled: &on, PasswordAuthentication: &off, AuthorizedKeys: []string{testSSHKey}}
+	return p
+}
+
+func checkHash(t *testing.T, hash string) {
+	t.Helper()
+	if ok, err := shacrypt.Verify(testPassword, hash); err != nil || !ok {
+		t.Errorf("password hash %q does not verify (%v)", hash, err)
+	}
+}
+
+func TestInjectBaseImageUserAndSSH(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{BaseImageMarker: "meteor_settings=2\n", CmdlineFile: stockCmdline})
+	injectInto(t, path, v3Profile())
+
+	env := readBack(t, path, MeteorEnvFile)
+	if strings.Contains(env, testPassword) {
+		t.Fatal("plain-text password on the card")
+	}
+	vals := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(env), "\n") {
+		k, v, _ := strings.Cut(line, "=")
+		vals[k] = v
+	}
+	checkHash(t, vals["METEOR_USER_PASSWORD_HASH"])
+	for k, want := range map[string]string{
+		"METEOR_USER":               "ops",
+		"METEOR_SSH_ENABLED":        "true",
+		"METEOR_SSH_PASSWORD_AUTH":  "false",
+		"METEOR_SSH_AUTHORIZED_KEY": testSSHKey,
+	} {
+		if vals[k] != want {
+			t.Errorf("%s = %q, want %q", k, vals[k], want)
+		}
+	}
+	if _, ok := vals["METEOR_SSH_USER"]; ok {
+		t.Error("METEOR_SSH_USER written although the key goes to the user")
+	}
+}
+
+func TestInjectCloudInitUserAndSSH(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData, CmdlineFile: stockCmdline})
+	injectInto(t, path, v3Profile())
+	injectInto(t, path, v3Profile()) // a second write must not add the user twice
+
+	raw := readBack(t, path, UserDataFile)
+	if strings.Contains(raw, testPassword) {
+		t.Fatal("plain-text password on the card")
+	}
+	var ud struct {
+		Users []struct {
+			Name       string   `yaml:"name"`
+			Groups     string   `yaml:"groups"`
+			Sudo       string   `yaml:"sudo"`
+			LockPasswd *bool    `yaml:"lock_passwd"`
+			Passwd     string   `yaml:"passwd"`
+			Keys       []string `yaml:"ssh_authorized_keys"`
+		} `yaml:"users"`
+		PwAuth *bool    `yaml:"ssh_pwauth"`
+		Keys   []string `yaml:"ssh_authorized_keys"`
+		RunCmd []string `yaml:"runcmd"`
+	}
+	if err := yaml.Unmarshal([]byte(raw), &ud); err != nil {
+		t.Fatal(err)
+	}
+	if len(ud.Users) != 2 || ud.Users[0].Name != "pi" {
+		t.Fatalf("users = %+v", ud.Users)
+	}
+	u := ud.Users[1]
+	if u.Name != "ops" || !strings.Contains(u.Groups, "sudo") || u.Sudo == "" || u.LockPasswd == nil || *u.LockPasswd {
+		t.Errorf("user = %+v", u)
+	}
+	checkHash(t, u.Passwd)
+	if len(u.Keys) != 1 || u.Keys[0] != testSSHKey || len(ud.Keys) != 0 {
+		t.Errorf("key placement: user %v, top level %v", u.Keys, ud.Keys)
+	}
+	if ud.PwAuth == nil || *ud.PwAuth {
+		t.Errorf("ssh_pwauth = %v", ud.PwAuth)
+	}
+	if n := countOf(ud.RunCmd, sshEnableCommand); n != 1 {
+		t.Errorf("runcmd has %d ssh enable entries: %v", n, ud.RunCmd)
+	}
+	fsck(t, path)
+}
+
+func countOf(list []string, s string) int {
+	n := 0
+	for _, v := range list {
+		if v == s {
+			n++
+		}
+	}
+	return n
+}
+
+func TestInjectLegacyImageUserAndSSH(t *testing.T) {
+	path := syntheticDisk(t, map[string]string{CmdlineFile: stockCmdline})
+	p := v3Profile()
+	p.Enrollment = nil
+	res := injectInto(t, path, p)
+
+	name, hash, _ := strings.Cut(strings.TrimSpace(readBack(t, path, UserconfFile)), ":")
+	if name != "ops" {
+		t.Errorf("userconf.txt user = %q", name)
+	}
+	checkHash(t, hash)
+	if got := readBack(t, path, SSHFile); got != "" {
+		t.Errorf("ssh file = %q", got)
+	}
+	joined := strings.Join(res.Warnings, " ")
+	if !strings.Contains(joined, "SSH key was not written") || !strings.Contains(joined, "password logins stay allowed") {
+		t.Errorf("warnings = %v", res.Warnings)
+	}
+	fsck(t, path)
+}
+
+// configDisk is syntheticDisk plus a third partition: FAT32 labelled METEORCFG.
+func configDisk(t *testing.T) string {
+	t.Helper()
+	path := syntheticDisk(t, map[string]string{UserDataFile: stockUserData})
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cfgStart := uint32(bootStart + bootSectors + rootSectors)
+	if err := f.Truncate(int64(cfgStart+bootSectors) * 512); err != nil {
+		t.Fatal(err)
+	}
+	mbr := make([]byte, 512)
+	if _, err := f.ReadAt(mbr, 0); err != nil {
+		t.Fatal(err)
+	}
+	e := mbr[446+16*2:]
+	e[4] = 0x0c
+	binary.LittleEndian.PutUint32(e[8:], cfgStart)
+	binary.LittleEndian.PutUint32(e[12:], bootSectors)
+	if _, err := f.WriteAt(mbr, 0); err != nil {
+		t.Fatal(err)
+	}
+	dev := &partitionDevice{disk: f, offset: int64(cfgStart) * 512, size: bootSectors * 512}
+	var fm fat.Formatter
+	if err := fm.Format(dev, 512, bootSectors, fat.FormatParams{Label: ConfigLabel, Format: fat.FormatFAT32}); err != nil {
+		t.Fatalf("format: %v", err)
+	}
+	// The formatter leaves "NO NAME"; set the boot-sector label as mkfs.vfat -n does.
+	if _, err := f.WriteAt([]byte("METEORCFG  "), int64(cfgStart)*512+71); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestOpenBootPrefersTheMeteorConfigPartition(t *testing.T) {
+	path := configDisk(t)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	v, err := OpenBoot(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Label != ConfigLabel || v.Partition.Index != 3 {
+		t.Errorf("opened partition %d labelled %q", v.Partition.Index, v.Label)
+	}
+	if v.Exists(UserDataFile) {
+		t.Error("expected the empty config partition, not the boot partition")
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
 }

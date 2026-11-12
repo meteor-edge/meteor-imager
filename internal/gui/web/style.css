@@ -33,10 +33,12 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.45; }
 .top { display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
 .brand { font-weight: 600; font-size: 17px; display: flex; align-items: center; gap: 8px; }
 .logo { display: block; }
+.app-note { margin: 0; padding: 8px 20px; font-size: 13px; color: var(--muted); text-align: center; border-bottom: 1px solid var(--line); }
 main { max-width: 720px; margin: 0 auto; padding: 20px 16px 60px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; }
 h1 { font-size: 20px; margin: 0 0 14px; }
@@ -62,7 +64,7 @@ button.link { border: none; background: none; color: var(--accent); padding: 4px
 .muted { color: var(--muted); font-weight: 400; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
 .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-.actions .back { margin-right: auto; }
+.actions .back, .actions .left { margin-right: auto; }
 fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 4px 14px 12px; margin: 14px 0; }
 legend { padding: 0 6px; }
 legend label.check { margin: 0; font-weight: 600; }
@@ -78,6 +80,7 @@ summary { cursor: pointer; color: var(--muted); }
 .tabs { display: flex; gap: 4px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
 .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; }
 .tabs button[aria-selected=true] { border-bottom-color: var(--accent); font-weight: 600; }
+.tabs.mode { margin-bottom: 16px; }
 
 .list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
 .item { display: flex; gap: 12px; align-items: flex-start; padding: 12px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
