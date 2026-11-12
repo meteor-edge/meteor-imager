@@ -67,14 +67,15 @@
   <!-- 2. Settings -->
   <section id="step-2" class="card" hidden>
     <h1>Card settings</h1>
-    <p class="hint">Written to the card’s boot partition. Nothing here is sent to the server or saved by Meteor Imager, except the non-secret fields if you tick “Remember”.</p>
+    <p class="hint">First configure the card like Raspberry Pi Imager (Wi-Fi, user, SSH). MeteorCloud enrollment is optional. Written to the card’s boot partition; secrets are not sent to the server. Tick “Remember” only for non-secret fields.</p>
 
     <div class="tabs" role="tablist">
-      <button role="tab" id="tab-general" aria-selected="true" type="button">General</button>
-      <button role="tab" id="tab-meteor" aria-selected="false" type="button">MeteorCloud</button>
+      <button role="tab" id="tab-general" aria-selected="true" type="button">OS settings</button>
+      <button role="tab" id="tab-meteor" aria-selected="false" type="button">MeteorCloud (optional)</button>
     </div>
 
     <div id="pane-general">
+    <p class="hint">Hostname, login user, Wi-Fi and SSH — the same ideas as OS customisation in Raspberry Pi Imager.</p>
     <div class="grid2">
       <div>
         <label for="hostname">Hostname</label>
@@ -87,41 +88,43 @@
     </div>
 
     <fieldset>
-      <legend><label class="check"><input type="checkbox" id="use-user"> Set username and password</label></legend>
+      <legend><label class="check"><input type="checkbox" id="use-user" checked> Set username and password</label></legend>
       <div id="user-fields">
         <div class="grid2">
           <div>
             <label for="user-name">Username</label>
-            <input id="user-name" placeholder="pi" autocomplete="off" spellcheck="false" autocapitalize="off">
+            <input id="user-name" value="pi" placeholder="pi" autocomplete="off" spellcheck="false" autocapitalize="off">
           </div>
           <div>
             <label for="user-password">Password</label>
             <div class="row">
               <input id="user-password" type="password" autocomplete="new-password" spellcheck="false">
+              <button type="button" class="generate" data-for="user-password" title="Generate a random password">Generate</button>
               <button type="button" class="reveal" data-for="user-password">Show</button>
             </div>
           </div>
         </div>
-        <p class="hint">The image’s first user is renamed to this name (or created). Only a hash of the password goes on the card.</p>
+        <p class="hint">The image’s first user is renamed to this name (or created). Only a hash of the password goes on the card. Use Generate, then copy the password somewhere safe.</p>
       </div>
     </fieldset>
 
     <fieldset>
-      <legend><label class="check"><input type="checkbox" id="use-wifi" checked> Connect to Wi-Fi</label></legend>
+      <legend><label class="check"><input type="checkbox" id="use-wifi" checked> Configure wireless LAN</label></legend>
       <div id="wifi-fields">
-        <label for="ssid">Network name (SSID)</label>
+        <label for="ssid">SSID</label>
         <input id="ssid" autocomplete="off" spellcheck="false">
-        <label for="psk">Password</label>
+        <label for="psk">Wi-Fi password</label>
         <div class="row">
           <input id="psk" type="password" autocomplete="new-password" spellcheck="false">
+          <button type="button" class="generate" data-for="psk" title="Generate a random password">Generate</button>
           <button type="button" class="reveal" data-for="psk">Show</button>
         </div>
         <div class="grid2">
           <div>
-            <label for="country">Country</label>
+            <label for="country">Wireless LAN country</label>
             <input id="country" maxlength="2" placeholder="DE" autocomplete="off" class="upper">
           </div>
-          <label class="check end"><input type="checkbox" id="hidden-ssid"> Hidden network</label>
+          <label class="check end"><input type="checkbox" id="hidden-ssid"> Hidden SSID</label>
         </div>
         <p class="hint warn-text">The Wi-Fi password is stored on the card’s boot partition until first boot. Anyone with the card can read it.</p>
       </div>
@@ -134,14 +137,15 @@
         <label class="check"><input type="radio" name="ssh-auth" id="ssh-auth-key"> Allow public-key authentication only</label>
         <label for="ssh-key">SSH public key <span id="ssh-key-optional" class="muted">(optional)</span></label>
         <input id="ssh-key" placeholder="ssh-ed25519 AAAA… you@laptop" autocomplete="off" spellcheck="false">
-        <p class="hint">With password authentication you log in as the user above: <span class="mono">ssh user@hostname.local</span>. The key is added for that user, or the image’s first user.</p>
+        <p class="hint">Password login uses the user password above: <span class="mono">ssh user@hostname.local</span>. The key is added for that user, or the image’s first user.</p>
       </div>
     </fieldset>
     </div>
 
     <div id="pane-meteor" hidden>
+    <p class="hint">Not required for Wi-Fi or SSH. Turn this on to put enrollment settings on the card so the device can request a token on first boot. You can paste values from the MeteorCloud console settings file, or fill the boxes below.</p>
     <fieldset>
-      <legend><label class="check"><input type="checkbox" id="use-enroll" checked> Register this device with MeteorCloud on first boot</label></legend>
+      <legend><label class="check"><input type="checkbox" id="use-enroll"> Register this device with MeteorCloud on first boot</label></legend>
       <div id="enroll-fields">
         <label for="domain">MeteorCloud domain the Pi connects to</label>
         <input id="domain" placeholder="fleet.example.com" spellcheck="false" autocomplete="off">
@@ -150,7 +154,7 @@
           <input id="api-key" type="password" placeholder="key_…" autocomplete="new-password" spellcheck="false">
           <button type="button" class="reveal" data-for="api-key">Show</button>
         </div>
-        <p class="hint">Create one in MeteorCloud under Devices → Enrollment keys. Give it an expiry date and revoke it when the batch is done.</p>
+        <p class="hint">Create one in MeteorCloud under Devices → Enrollment keys, or download a settings file from the console and copy the key. Give it an expiry date and revoke it when the batch is done.</p>
         <label for="device-name">Device name in MeteorCloud (optional)</label>
         <input id="device-name" placeholder="Same as the hostname" maxlength="63" autocomplete="off" spellcheck="false">
         <p class="hint">On first boot the device asks to join with this key (request-token) and waits until an administrator approves it in the console.</p>

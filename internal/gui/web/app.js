@@ -134,6 +134,17 @@ function renderImages() {
 }
 
 // ---------- Step 2: settings ----------
+const PASSWORD_ALPHABET =
+  "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
+
+/** Random password for user / Wi-Fi fields (browser crypto only). */
+function generatePassword(length) {
+  const size = Math.max(8, Math.min(length || 16, 63));
+  const bytes = new Uint8Array(size);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => PASSWORD_ALPHABET[b % PASSWORD_ALPHABET.length]).join("");
+}
+
 function setSettingsTab(tab) {
   $("tab-general").setAttribute("aria-selected", tab === "general");
   $("tab-meteor").setAttribute("aria-selected", tab === "meteor");
@@ -468,8 +479,11 @@ function applyPrefs(p) {
   $("country").value = p.wifi_country || guessCountry();
   $("hostname").value = p.hostname || "";
   $("timezone").value = p.timezone || "";
-  $("user-name").value = p.user_name || "";
-  $("use-user").checked = !!p.user_name;
+  // Saved username turns the section on; otherwise keep HTML defaults (user on, "pi").
+  if (p.user_name) {
+    $("user-name").value = p.user_name;
+    $("use-user").checked = true;
+  }
   // SSH with password login is on unless it was turned off last time.
   $("use-ssh").checked = p.ssh_enabled !== false;
   $(p.ssh_password_authentication === false ? "ssh-auth-key" : "ssh-auth-password").checked = true;
@@ -540,6 +554,15 @@ async function init() {
       const input = $(b.dataset.for);
       input.type = input.type === "password" ? "text" : "password";
       b.textContent = input.type === "password" ? "Show" : "Hide";
+    };
+  });
+  document.querySelectorAll(".generate").forEach((b) => {
+    b.onclick = () => {
+      const input = $(b.dataset.for);
+      input.value = generatePassword(16);
+      input.type = "text";
+      const reveal = document.querySelector(`.reveal[data-for="${b.dataset.for}"]`);
+      if (reveal) reveal.textContent = "Hide";
     };
   });
   $("next-2").onclick = () => {

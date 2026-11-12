@@ -36,10 +36,14 @@ Record the version, OS version, card reader and card for each run.
 
 ### Settings step
 
-- [ ] The domain is pre-filled from the server address and can be edited.
-- [ ] A missing key, a short Wi-Fi password or a missing country is shown inline, and you cannot continue.
+- [ ] Tabs are **OS settings** (first) and **MeteorCloud (optional)**.
+- [ ] On a fresh start, user / Wi-Fi / SSH are on; MeteorCloud enroll is **off**.
+- [ ] **Generate** fills the user password and Wi-Fi password (shown as text); **Show** still works.
+- [ ] The domain is pre-filled from the server address when enroll is on, and can be edited.
+- [ ] With enroll off, you can continue with only OS settings (SSID + passwords filled).
+- [ ] With enroll on, a missing key, a short Wi-Fi password or a missing country is shown inline.
 - [ ] **Show** reveals the password and key; the browser does not offer to save them.
-- [ ] **General** and **MeteorCloud** tabs switch; a problem on the other tab opens that tab.
+- [ ] A problem on the other tab opens that tab.
 - [ ] Username with capitals or `root`, an empty user password, or "public key only" without a key
       is shown inline.
 - [ ] On a fresh start (no saved settings) **Enable SSH** is ticked with password authentication.
