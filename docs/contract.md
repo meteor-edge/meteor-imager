@@ -89,7 +89,9 @@ Meteor Imager picks the config partition among the FAT partitions (MBR types `01
 or the GPT basic data / EFI system partition types): one labelled `METEORCFG` if the image has it
 (device types without a FAT boot partition, such as Jetson or NUC base images), otherwise the first
 one (the Raspberry Pi boot partition, or the EFI system partition). It edits files in that
-partition's root directory with a userspace FAT driver. Nothing outside that partition is changed.
+partition's root directory with a userspace FAT driver. Those file edits stay inside that
+partition. When the card is larger than the image, the last Linux partition is extended to
+the end of the card; boot and any other partition in front of it keep their image size.
 
 ### Meteor base images (`.meteor-settings` on the config partition)
 

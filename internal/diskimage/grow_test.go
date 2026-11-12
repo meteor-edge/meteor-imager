@@ -86,6 +86,18 @@ func TestGrowLinuxRootExtends4GiBImageToLargerCards(t *testing.T) {
 	if _, _, ok := GrowLinuxRoot(same, imageSectors*SectorSize); ok {
 		t.Fatal("grew a 4 GiB image onto a 4 GiB card")
 	}
+	// SD cards are sold in decimal gigabytes (16 GB, 32 GB), not GiB.
+	for _, label := range []int64{16, 32} {
+		card := label * 1_000_000_000
+		head := testMBR(root)
+		_, sectors, ok := GrowLinuxRoot(head, card)
+		if !ok {
+			t.Fatalf("%d GB card was not extended", label)
+		}
+		if int64(sectors)*SectorSize < (label-1)*1_000_000_000 {
+			t.Fatalf("%d GB card: root is only %d bytes", label, int64(sectors)*SectorSize)
+		}
+	}
 }
 
 func TestGrowLinuxRootSkipsGPT(t *testing.T) {

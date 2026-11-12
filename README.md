@@ -132,7 +132,7 @@ Device paths: `/dev/sdX` or `/dev/mmcblkN` on Linux, `/dev/diskN` on macOS, and
 
 ## What goes on the card
 
-Only the FAT boot partition is changed. The root filesystem is written exactly as it is in the image.
+Settings are written only on the FAT boot partition (or a `METEORCFG` partition). Those partitions stay the size they have in the image. The last Linux partition, root on Raspberry Pi OS, is extended so the card is filled.
 
 **Meteor base images** (MeteorCloud first boot preinstalled; they carry `.meteor-settings`) get a
 single `.meteorenv` with every setting: domain, key, device name, hostname, timezone, Wi-Fi, user
