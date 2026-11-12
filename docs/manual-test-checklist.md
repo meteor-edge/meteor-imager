@@ -38,7 +38,8 @@ Record the version, OS version, card reader and card for each run.
 
 - [ ] Tabs are **OS settings** (first) and **MeteorCloud (optional)**.
 - [ ] On a fresh start, user / Wi-Fi / SSH are on; MeteorCloud enroll is **off**.
-- [ ] **Generate** fills the user password and Wi-Fi password (shown as text); **Show** still works.
+- [ ] **Generate** fills the SSH password and Wi-Fi password (shown as text); **Show** still works.
+- [ ] **Upload…** a `meteorenv.txt` fills OS + MeteorCloud boxes; a `METEOR_USER_PASSWORD_HASH` is kept for writing until you Generate/type a new password.
 - [ ] The domain is pre-filled from the server address when enroll is on, and can be edited.
 - [ ] With enroll off, you can continue with only OS settings (SSID + passwords filled).
 - [ ] With enroll on, a missing key, a short Wi-Fi password or a missing country is shown inline.
