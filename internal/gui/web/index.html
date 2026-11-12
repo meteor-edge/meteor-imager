@@ -109,8 +109,8 @@
         <label for="psk">Wi-Fi password</label>
         <div class="row">
           <input id="psk" type="password" autocomplete="new-password" spellcheck="false">
-          <button type="button" class="generate" data-for="psk" title="Generate a random password">Generate</button>
-          <button type="button" class="reveal" data-for="psk">Show</button>
+          <button type="button" class="generate" data-field="psk" title="Generate a random password">Generate</button>
+          <button type="button" class="reveal" data-field="psk">Show</button>
         </div>
         <div class="grid2">
           <div>
@@ -133,8 +133,8 @@
           <label for="user-password">SSH password</label>
           <div class="row">
             <input id="user-password" type="password" autocomplete="new-password" spellcheck="false">
-            <button type="button" class="generate" data-for="user-password" title="Generate a random password">Generate</button>
-            <button type="button" class="reveal" data-for="user-password">Show</button>
+            <button type="button" class="generate" data-field="user-password" title="Generate a random password">Generate</button>
+            <button type="button" class="reveal" data-field="user-password">Show</button>
           </div>
           <p id="password-hash-note" class="hint" hidden>A password hash from the uploaded file will be written as-is. Generate or type a new password to replace it.</p>
           <p class="hint">This is the password for <span class="mono">ssh user@hostname.local</span>. Only a hash goes on the card.</p>
@@ -158,7 +158,7 @@
         <label for="api-key">Enrollment key</label>
         <div class="row">
           <input id="api-key" type="password" placeholder="key_…" autocomplete="new-password" spellcheck="false">
-          <button type="button" class="reveal" data-for="api-key">Show</button>
+          <button type="button" class="reveal" data-field="api-key">Show</button>
         </div>
         <p class="hint">Create one in MeteorCloud under Devices → Enrollment keys, or download a settings file from the console and copy the key. Give it an expiry date and revoke it when the batch is done.</p>
         <label for="device-name">Device name in MeteorCloud (optional)</label>

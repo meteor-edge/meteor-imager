@@ -217,7 +217,7 @@ function applyMeteorenv(map) {
     if (map.METEOR_WIFI_PSK) {
       $("psk").value = map.METEOR_WIFI_PSK;
       $("psk").type = "text";
-      const reveal = document.querySelector('.reveal[data-for="psk"]');
+      const reveal = document.querySelector('.reveal[data-field="psk"]');
       if (reveal) reveal.textContent = "Hide";
     }
     if (map.METEOR_WIFI_COUNTRY) $("country").value = map.METEOR_WIFI_COUNTRY.toUpperCase();
@@ -253,7 +253,7 @@ function applyMeteorenv(map) {
     if (map.METEOR_API_KEY) {
       $("api-key").value = map.METEOR_API_KEY;
       $("api-key").type = "text";
-      const reveal = document.querySelector('.reveal[data-for="api-key"]');
+      const reveal = document.querySelector('.reveal[data-field="api-key"]');
       if (reveal) reveal.textContent = "Hide";
     }
     if (map.METEOR_NAME) $("device-name").value = map.METEOR_NAME;
@@ -556,7 +556,11 @@ async function startOver() {
     if (e.type === "checkbox" || e.type === "radio") e.checked = e.defaultChecked;
     else e.value = e.defaultValue;
   });
-  document.querySelectorAll(".reveal").forEach((b) => { $(b.dataset.for).type = "password"; b.textContent = "Show"; });
+  document.querySelectorAll(".reveal").forEach((b) => {
+    const input = $(b.getAttribute("data-field"));
+    if (input) input.type = "password";
+    b.textContent = "Show";
+  });
   $("server").value = state.server || prefs.server_url || "";
   $("insecure").checked = state.insecure;
   applyPrefs(prefs);
@@ -677,21 +681,29 @@ async function init() {
   $("backup-show-all").onchange = loadBackupDevices;
   $("backup-out").addEventListener("input", renderBackupDevices);
   $("backup-start").onclick = startBackup;
+  // data-field (not data-for): dataset.for is unreliable in some browsers.
   document.querySelectorAll(".reveal").forEach((b) => {
-    b.onclick = () => {
-      const input = $(b.dataset.for);
+    b.onclick = (event) => {
+      event.preventDefault();
+      const id = b.getAttribute("data-field");
+      const input = id && $(id);
+      if (!input) return;
       input.type = input.type === "password" ? "text" : "password";
       b.textContent = input.type === "password" ? "Show" : "Hide";
     };
   });
   document.querySelectorAll(".generate").forEach((b) => {
-    b.onclick = () => {
-      const input = $(b.dataset.for);
+    b.onclick = (event) => {
+      event.preventDefault();
+      const id = b.getAttribute("data-field");
+      const input = id && $(id);
+      if (!input) return;
       input.value = generatePassword(16);
       input.type = "text";
-      const reveal = document.querySelector(`.reveal[data-for="${b.dataset.for}"]`);
+      input.focus();
+      const reveal = document.querySelector(`.reveal[data-field="${id}"]`);
       if (reveal) reveal.textContent = "Hide";
-      if (b.dataset.for === "user-password") {
+      if (id === "user-password") {
         state.importedPasswordHash = "";
         updatePasswordHashNote();
       }
