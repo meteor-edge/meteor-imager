@@ -462,7 +462,7 @@ async function startWrite() {
 const STAGES = {
   write: [
     ["download", "Download"], ["open", "Prepare card"], ["write", "Write"], ["verify", "Verify"],
-    ["configure", "Settings"], ["finish", "Finish"], ["eject", "Eject"],
+    ["configure", "Settings"], ["finish", "Finish"], ["grow", "Grow root"], ["eject", "Eject"],
   ],
   backup: [["open", "Prepare card"], ["read", "Read"], ["shrink", "Shrink"], ["save", "Save"], ["eject", "Eject"]],
 };
@@ -520,6 +520,8 @@ async function poll() {
   if (r.boot && r.boot.written && r.boot.written.length) lines.push(el("p", { class: "muted" }, "Boot partition: " + r.boot.written.join(", ")));
   if (state.sshLogin) lines.push(el("p", {}, "After first boot, log in with the user’s password: ", el("span", { class: "mono" }, state.sshLogin)));
   for (const w of (r.boot && r.boot.warnings) || []) lines.push(el("p", { class: "banner warn" }, w));
+  if (r.grow_note) lines.push(el("p", { class: "banner warn" }, r.grow_note));
+  else if (r.root_partition) lines.push(el("p", { class: "muted" }, "Root filesystem extended to the card."));
   $("result").replaceChildren(...lines);
 }
 

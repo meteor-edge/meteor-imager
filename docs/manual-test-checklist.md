@@ -108,7 +108,8 @@ Record the version, OS version, card reader and card for each run.
       "shrunk"; without e2fsprogs the checkbox is disabled with a hint.
 - [ ] Upload the backup as an OS image, publish it, and write two cards from it with different
       hostnames, users and Wi-Fi.
-- [ ] Both boot, grow the root filesystem to the card (`df -h /`), have different SSH host keys and
+- [ ] Both boot with the root filesystem filling the card (`df -h /`; on Linux the imager grows it
+      while writing). They have different SSH host keys and
       `/etc/machine-id`, Docker works, and both appear in MeteorCloud as pending enrollments.
 - [ ] **Cancel** during a backup leaves no file.
 - [ ] **Write this backup to a card** opens Settings with the backup as the local file; writing it

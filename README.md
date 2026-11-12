@@ -70,7 +70,7 @@ To write the next card, press **Write another card**. Your settings stay filled 
    ```
 3. Put the card in your computer, open **Back up a card**, pick the card and save
    `….img.gz`. With e2fsprogs installed the image is shrunk to the data on the card, so it fits
-   smaller cards; each card grows it back on first boot.
+   smaller cards. Writing it back extends the root partition to the card.
 4. Write cards from it right away (**Write this backup to a card** when the backup finishes, or
    **Local file** and pick the `.img.gz`), or share it: upload the file in MeteorCloud as an OS
    image and tick **Show in Meteor Imager**.
@@ -184,9 +184,14 @@ first boot preinstalled in the image. The full format is in [docs/contract.md](d
    chunks. The first megabyte, which holds the partition table, is held back.
 2. Verify: the card is read back (page cache dropped) and its SHA-256 compared with what was written.
 3. The boot partition is edited in place with a userspace FAT driver: no mounting and no root.
-4. The partition table goes last, and the changed sectors are read back. Until this step the OS
+4. The last Linux partition (MBR type 83) is extended to a 4 MiB boundary at the end of the
+   card. The boot partition stays the size it has in the image. GPT images are written as they are.
+5. The partition table goes last, and the changed sectors are read back. Until this step the OS
    sees an empty card, so it never mounts or locks a half-written card.
-5. The card is ejected.
+6. On Linux, with e2fsprogs installed, the ext4 filesystem is grown to that partition
+   (`e2fsck -fp`, then `resize2fs`). The card is already written if this step cannot run; the
+   Pi can still grow the filesystem on first boot.
+7. The card is ejected.
 
 Raw disk access works the way the OS expects:
 
