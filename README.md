@@ -37,14 +37,14 @@ Get the build for your system from [Releases](https://github.com/meteor-edge/met
    and pick one of the OS images the server publishes. No login is needed. You can also pick a local
    `.img`, `.img.xz`, `.gz` or `.zip` file.
 2. **Settings.** Two tabs:
-   - **General**, like Raspberry Pi Imager: hostname, timezone, **username and password** (the
-     image's first user is renamed; only a hash of the password goes on the card), **Wi-Fi** name,
-     password and country, and **SSH** (password login, or public key only with your key). SSH with
-     password login is on by default, so after first boot you can `ssh <user>@<hostname>.local` with
-     the username and password you set; untick **Enable SSH** to leave the image's SSH setting alone.
-   - **MeteorCloud**: the **domain** the Pi connects to (filled in from the address), an
-     **enrollment key** (`key_…`, created in MeteorCloud under Devices → Enrollment keys) and an
-     optional device name. Untick it to write a card that does not register itself.
+   - **OS settings**, like Raspberry Pi Imager: hostname, timezone, **username and password**
+     (Generate fills a random password; only a hash goes on the card), **Wi-Fi** SSID / password /
+     country, and **SSH** (password login, or public key only). User, Wi-Fi and SSH are on by
+     default so after first boot you can `ssh <user>@<hostname>.local` with the password you set
+     or generated.
+   - **MeteorCloud (optional)**: not required for Wi-Fi or SSH. Tick **Register…** to add the
+     **domain**, **enrollment key** (`key_…` from Devices → Enrollment keys, or from a console
+     settings file) and optional device name. Leave it off to write a card that does not enroll.
 3. **Card.** Pick the SD card. Only removable disks are listed. Disks that hold the running system are
    never listed.
 4. **Write.** Confirm, and Meteor Imager writes the image, reads it back to verify it, writes the
@@ -70,7 +70,7 @@ To write the next card, press **Write another card**. Your settings stay filled 
    ```
 3. Put the card in your computer, open **Back up a card**, pick the card and save
    `….img.gz`. With e2fsprogs installed the image is shrunk to the data on the card, so it fits
-   smaller cards; each card grows it back on first boot.
+   smaller cards. Writing it back extends the root partition to the card.
 4. Write cards from it right away (**Write this backup to a card** when the backup finishes, or
    **Local file** and pick the `.img.gz`), or share it: upload the file in MeteorCloud as an OS
    image and tick **Show in Meteor Imager**.
@@ -132,7 +132,7 @@ Device paths: `/dev/sdX` or `/dev/mmcblkN` on Linux, `/dev/diskN` on macOS, and
 
 ## What goes on the card
 
-Only the FAT boot partition is changed. The root filesystem is written exactly as it is in the image.
+Settings are written only on the FAT boot partition (or a `METEORCFG` partition). Those partitions stay the size they have in the image. The last Linux partition, root on Raspberry Pi OS, is extended so the card is filled.
 
 **Meteor base images** (MeteorCloud first boot preinstalled; they carry `.meteor-settings`) get a
 single `.meteorenv` with every setting: domain, key, device name, hostname, timezone, Wi-Fi, user
@@ -184,9 +184,14 @@ first boot preinstalled in the image. The full format is in [docs/contract.md](d
    chunks. The first megabyte, which holds the partition table, is held back.
 2. Verify: the card is read back (page cache dropped) and its SHA-256 compared with what was written.
 3. The boot partition is edited in place with a userspace FAT driver: no mounting and no root.
-4. The partition table goes last, and the changed sectors are read back. Until this step the OS
+4. The last Linux partition (MBR type 83) is extended to a 4 MiB boundary at the end of the
+   card. The boot partition stays the size it has in the image. GPT images are written as they are.
+5. The partition table goes last, and the changed sectors are read back. Until this step the OS
    sees an empty card, so it never mounts or locks a half-written card.
-5. The card is ejected.
+6. On Linux, with e2fsprogs installed, the ext4 filesystem is grown to that partition
+   (`e2fsck -fp`, then `resize2fs`). The card is already written if this step cannot run; the
+   Pi can still grow the filesystem on first boot.
+7. The card is ejected.
 
 Raw disk access works the way the OS expects:
 

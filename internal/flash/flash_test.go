@@ -159,6 +159,18 @@ func TestWriteVerifyConfigure(t *testing.T) {
 	if !bytes.Equal(card.data[(8192+131072)*512:][:600], raw[(8192+131072)*512:][:600]) {
 		t.Error("root partition differs from the image")
 	}
+	if rep.RootPartition != 2 {
+		t.Fatalf("root partition = %d", rep.RootPartition)
+	}
+	start := uint64(8192 + 131072)
+	end := uint64(len(card.data)/diskimage.SectorSize) / uint64(diskimage.RootAlign/diskimage.SectorSize) * uint64(diskimage.RootAlign/diskimage.SectorSize)
+	if rep.RootSectors != end-start {
+		t.Fatalf("root sectors = %d, want %d", rep.RootSectors, end-start)
+	}
+	written, err := diskimage.ReadPartitions(bytes.NewReader(card.data[:512]))
+	if err != nil || written[1].Sectors != rep.RootSectors || written[0].Sectors != 131072 {
+		t.Fatalf("written table = %+v, %v", written, err)
+	}
 }
 
 func TestWriteDetectsBadCard(t *testing.T) {
