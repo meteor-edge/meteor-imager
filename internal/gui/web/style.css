@@ -57,7 +57,10 @@ button.primary { background: var(--accent); color: var(--accent-text); border-co
 button.danger-btn { background: var(--danger); border-color: var(--danger); color: #fff; }
 button.link { border: none; background: none; color: var(--accent); padding: 4px 0; }
 .row { display: flex; gap: 8px; align-items: center; }
-.row.between { justify-content: space-between; }
+.row.between { justify-content: space-between; align-items: flex-start; }
+.import-box { border: 1px dashed var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; background: var(--bg); }
+.file-btn { display: inline-block; font: inherit; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; white-space: nowrap; }
+.file-btn:hover { border-color: var(--accent); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .hint { color: var(--muted); font-size: 13px; margin: 6px 0; }
 .warn-text { color: var(--danger); }

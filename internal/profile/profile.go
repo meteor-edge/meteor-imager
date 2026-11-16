@@ -58,8 +58,12 @@ type Enrollment struct {
 type User struct {
 	Name string `json:"name"`
 	// Password is plain text here and reaches the card only as a SHA-512 crypt
-	// hash. Empty leaves the password unchanged (log in with an SSH key).
+	// hash. Empty leaves the password unchanged (log in with an SSH key) unless
+	// PasswordHash is set.
 	Password string `json:"password,omitempty"`
+	// PasswordHash is an already hashed SHA-512 crypt value ($6$…), e.g. from an
+	// uploaded meteorenv.txt. Used only when Password is empty.
+	PasswordHash string `json:"password_hash,omitempty"`
 }
 
 // SSH configures the SSH server (v3) and adds a public key (v2).
@@ -163,6 +167,11 @@ func (p *FlashProfile) Validate() error {
 		}
 		if len(u.Password) > 256 || strings.ContainsAny(u.Password, "\x00\r\n") {
 			add("user.password must be at most 256 characters, without line breaks")
+		}
+		if u.PasswordHash != "" {
+			if !strings.HasPrefix(u.PasswordHash, "$6$") || strings.ContainsAny(u.PasswordHash, "\x00\r\n") {
+				add("user.password_hash must be a SHA-512 crypt hash ($6$…)")
+			}
 		}
 	}
 	if s := p.SSH; s != nil {
@@ -281,6 +290,7 @@ func (p *FlashProfile) Clear() {
 	}
 	if p.User != nil {
 		p.User.Password = ""
+		p.User.PasswordHash = ""
 	}
 }
 
@@ -300,6 +310,7 @@ func (p *FlashProfile) Redacted() FlashProfile {
 	if p.User != nil {
 		u := *p.User
 		u.Password = ""
+		u.PasswordHash = ""
 		c.User = &u
 	}
 	return c

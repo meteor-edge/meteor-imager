@@ -65,6 +65,13 @@ type Report struct {
 	BytesWritten int64          `json:"bytes_written"`
 	Verified     bool           `json:"verified"`
 	Boot         *bootfs.Result `json:"boot,omitempty"`
+	// RootPartition is the 1-based MBR slot extended to the card, or 0 when
+	// the image was written as-is (unknown size, GPT, or no spare space).
+	RootPartition int `json:"root_partition,omitempty"`
+	// RootSectors is that partition's new length in 512-byte sectors.
+	RootSectors uint64 `json:"root_sectors,omitempty"`
+	// GrowNote is set when the partition was extended but the filesystem was not.
+	GrowNote string `json:"grow_note,omitempty"`
 }
 
 const (
@@ -185,6 +192,13 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 		}
 		rep.Boot = res
 		progress(StageConfigure, 1, 0)
+	}
+
+	// Extend the last Linux partition to the card. The hash above used the
+	// original table, so this only changes the sector count written last.
+	if index, sectors, ok := diskimage.GrowLinuxRoot(head, capacity); ok {
+		rep.RootPartition = index
+		rep.RootSectors = uint64(sectors)
 	}
 
 	// 4. Partition table last, then confirm everything since step 2 landed.

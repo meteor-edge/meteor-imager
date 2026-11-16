@@ -87,6 +87,9 @@ func Inject(v *Volume, p *profile.FlashProfile, opt Options) (*Result, error) {
 			return nil, fmt.Errorf("hash the password: %w", err)
 		}
 		passwordHash = h
+	} else if p.User != nil && p.User.PasswordHash != "" {
+		// Already hashed (e.g. re-imported meteorenv.txt).
+		passwordHash = p.User.PasswordHash
 	}
 
 	if res.BaseImage {

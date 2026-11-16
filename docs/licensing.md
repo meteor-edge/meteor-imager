@@ -23,7 +23,7 @@ algorithm; no third-party code.
 
 | Tool | License | Use |
 |---|---|---|
-| [e2fsprogs](https://e2fsprogs.sourceforge.net/) (`e2fsck`, `resize2fs`, `dumpe2fs`) | GPL-2.0 | Optional. `backup` runs them as separate programs, when the user has installed them, to shrink a copy of the root filesystem. Not linked, bundled or redistributed. |
+| [e2fsprogs](https://e2fsprogs.sourceforge.net/) (`e2fsck`, `resize2fs`, `dumpe2fs`) | GPL-2.0 | Optional. Run as separate programs when installed, never linked or bundled. `backup` uses them to shrink a copy of the root filesystem. On Linux, writing a card uses `e2fsck` and `resize2fs` to grow that filesystem to the card. |
 
 Before adding a dependency, check its licence (no GPL/LGPL/AGPL or unclear terms) and add it to
 this table. To regenerate the list of linked modules:

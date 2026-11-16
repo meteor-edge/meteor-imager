@@ -22,6 +22,7 @@ import (
 
 	"github.com/meteor-edge/meteor-imager/internal/backup"
 	"github.com/meteor-edge/meteor-imager/internal/devices"
+	"github.com/meteor-edge/meteor-imager/internal/diskimage"
 	"github.com/meteor-edge/meteor-imager/internal/flash"
 	"github.com/meteor-edge/meteor-imager/internal/gui"
 	"github.com/meteor-edge/meteor-imager/internal/job"
@@ -608,6 +609,14 @@ func printReport(rep *flash.Report) {
 		}
 		for _, w := range rep.Boot.Warnings {
 			fmt.Fprintln(os.Stderr, "Warning:", w)
+		}
+	}
+	if rep.RootPartition > 0 {
+		if rep.GrowNote != "" {
+			fmt.Fprintln(os.Stderr, "Note:", rep.GrowNote)
+		} else {
+			fmt.Fprintf(os.Stderr, "Root partition %d extended to the card (%s).\n",
+				rep.RootPartition, devices.HumanSize(int64(rep.RootSectors)*diskimage.SectorSize))
 		}
 	}
 }

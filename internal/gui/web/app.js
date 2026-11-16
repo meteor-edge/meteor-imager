@@ -11,6 +11,8 @@ const state = {
   step: 1,
   backupDevices: [], backupDevice: null, backupDir: "", lastBackupPath: "",
   job: "write", // kind of the job the progress page shows
+  // From an uploaded meteorenv.txt when the plain password is not in the file.
+  importedPasswordHash: "",
 };
 
 const USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
@@ -134,6 +136,17 @@ function renderImages() {
 }
 
 // ---------- Step 2: settings ----------
+const PASSWORD_ALPHABET =
+  "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
+
+/** Random password for user / Wi-Fi fields (browser crypto only). */
+function generatePassword(length) {
+  const size = Math.max(8, Math.min(length || 16, 63));
+  const bytes = new Uint8Array(size);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => PASSWORD_ALPHABET[b % PASSWORD_ALPHABET.length]).join("");
+}
+
 function setSettingsTab(tab) {
   $("tab-general").setAttribute("aria-selected", tab === "general");
   $("tab-meteor").setAttribute("aria-selected", tab === "meteor");
@@ -155,8 +168,12 @@ function buildProfile() {
   const tz = $("timezone").value.trim();
   if (host) p.hostname = host;
   if (tz) p.timezone = tz;
-  if ($("use-user").checked) {
+  // SSH access: username/password live with the SSH section.
+  if ($("use-ssh").checked && $("use-user").checked) {
     p.user = { name: $("user-name").value.trim(), password: $("user-password").value };
+    if (!p.user.password && state.importedPasswordHash) {
+      p.user.password_hash = state.importedPasswordHash;
+    }
   }
   if ($("use-ssh").checked) {
     p.ssh = { enabled: true, password_authentication: $("ssh-auth-password").checked };
@@ -164,6 +181,99 @@ function buildProfile() {
     if (key) p.ssh.authorized_keys = [key];
   }
   return p;
+}
+
+/** Parse KEY=value meteorenv / .meteorenv text (same format the console downloads). */
+function parseMeteorenv(text) {
+  const out = {};
+  const cleaned = text.replace(/^\uFEFF/, "");
+  for (const raw of cleaned.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1);
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function truthy(v) {
+  return /^(1|true|yes|on)$/i.test(String(v || "").trim());
+}
+
+function applyMeteorenv(map) {
+  const notes = [];
+  if (map.METEOR_HOSTNAME) $("hostname").value = map.METEOR_HOSTNAME;
+  if (map.METEOR_TIMEZONE) $("timezone").value = map.METEOR_TIMEZONE;
+
+  if (map.METEOR_WIFI_SSID || map.METEOR_WIFI_PSK) {
+    $("use-wifi").checked = true;
+    if (map.METEOR_WIFI_SSID) $("ssid").value = map.METEOR_WIFI_SSID;
+    if (map.METEOR_WIFI_PSK) {
+      $("psk").value = map.METEOR_WIFI_PSK;
+      $("psk").type = "text";
+      const reveal = document.querySelector('.reveal[data-field="psk"]');
+      if (reveal) reveal.textContent = "Hide";
+    }
+    if (map.METEOR_WIFI_COUNTRY) $("country").value = map.METEOR_WIFI_COUNTRY.toUpperCase();
+    if (map.METEOR_WIFI_HIDDEN != null) $("hidden-ssid").checked = truthy(map.METEOR_WIFI_HIDDEN);
+  }
+
+  const sshOn = map.METEOR_SSH_ENABLED == null || truthy(map.METEOR_SSH_ENABLED);
+  const hasUser = !!(map.METEOR_USER || map.METEOR_USER_PASSWORD_HASH || map.METEOR_SSH_AUTHORIZED_KEY);
+  if (sshOn || hasUser) {
+    $("use-ssh").checked = true;
+    if (map.METEOR_SSH_PASSWORD_AUTH != null) {
+      $(truthy(map.METEOR_SSH_PASSWORD_AUTH) ? "ssh-auth-password" : "ssh-auth-key").checked = true;
+    }
+    if (map.METEOR_SSH_AUTHORIZED_KEY) $("ssh-key").value = map.METEOR_SSH_AUTHORIZED_KEY;
+  }
+  if (map.METEOR_USER || map.METEOR_USER_PASSWORD_HASH) {
+    $("use-user").checked = true;
+    if (map.METEOR_USER) $("user-name").value = map.METEOR_USER;
+    state.importedPasswordHash = "";
+    $("user-password").value = "";
+    if (map.METEOR_USER_PASSWORD_HASH) {
+      state.importedPasswordHash = map.METEOR_USER_PASSWORD_HASH;
+      notes.push("SSH password was a hash in the file; it will be written as-is unless you Generate or type a new one.");
+    }
+  }
+
+  if (map.METEOR_DOMAIN || map.METEOR_API_KEY) {
+    $("use-enroll").checked = true;
+    if (map.METEOR_DOMAIN) {
+      $("domain").value = map.METEOR_DOMAIN;
+      $("domain").dataset.auto = "0";
+    }
+    if (map.METEOR_API_KEY) {
+      $("api-key").value = map.METEOR_API_KEY;
+      $("api-key").type = "text";
+      const reveal = document.querySelector('.reveal[data-field="api-key"]');
+      if (reveal) reveal.textContent = "Hide";
+    }
+    if (map.METEOR_NAME) $("device-name").value = map.METEOR_NAME;
+  }
+
+  syncSettingsFields();
+  updatePasswordHashNote();
+  const status = $("import-status");
+  status.hidden = false;
+  status.textContent = notes.length
+    ? "Settings loaded. " + notes.join(" ")
+    : "Settings loaded into the form.";
+  // Open MeteorCloud tab when enrollment was in the file.
+  if (map.METEOR_DOMAIN || map.METEOR_API_KEY) setSettingsTab("meteor");
+  else setSettingsTab("general");
+}
+
+function updatePasswordHashNote() {
+  const note = $("password-hash-note");
+  note.hidden = !state.importedPasswordHash || !!$("user-password").value;
 }
 
 // Problems are tagged with their tab so the form can open it.
@@ -184,8 +294,8 @@ function checkSettings() {
     if (!/^[A-Z]{2}$/.test(p.wifi.country)) general("Enter the two-letter Wi-Fi country code, e.g. DE.");
   }
   if (p.user) {
-    if (!USER_RE.test(p.user.name) || p.user.name === "root") general("The username must be lower-case letters, digits, - or _ (not root).");
-    if (!p.user.password) general("Enter a password for the user.");
+    if (!USER_RE.test(p.user.name) || p.user.name === "root") general("The SSH username must be lower-case letters, digits, - or _ (not root).");
+    if (!p.user.password && !p.user.password_hash) general("Enter or Generate an SSH password for the user.");
   }
   if (p.ssh) {
     const key = p.ssh.authorized_keys && p.ssh.authorized_keys[0];
@@ -305,7 +415,10 @@ function renderSummary() {
   if (profile && profile.hostname) rows.push(["Hostname", profile.hostname]);
   if (profile && profile.timezone) rows.push(["Timezone", profile.timezone]);
   if (profile && profile.enrollment && profile.enrollment.device_name) rows.push(["Device name", profile.enrollment.device_name]);
-  if (profile && profile.user) rows.push(["User", `${profile.user.name}, password ••••••••`]);
+  if (profile && profile.user) {
+    const secret = profile.user.password || profile.user.password_hash ? "password ••••••••" : "no password";
+    rows.push(["SSH user", `${profile.user.name}, ${secret}`]);
+  }
   if (profile && profile.ssh) {
     const key = profile.ssh.authorized_keys ? ", key " + profile.ssh.authorized_keys[0].split(" ").slice(0, 2).join(" ").slice(0, 32) + "…" : "";
     rows.push(["SSH", (profile.ssh.password_authentication ? "on, password or key" : "on, key only") + key]);
@@ -349,7 +462,7 @@ async function startWrite() {
 const STAGES = {
   write: [
     ["download", "Download"], ["open", "Prepare card"], ["write", "Write"], ["verify", "Verify"],
-    ["configure", "Settings"], ["finish", "Finish"], ["eject", "Eject"],
+    ["configure", "Settings"], ["finish", "Finish"], ["grow", "Grow root"], ["eject", "Eject"],
   ],
   backup: [["open", "Prepare card"], ["read", "Read"], ["shrink", "Shrink"], ["save", "Save"], ["eject", "Eject"]],
 };
@@ -407,6 +520,8 @@ async function poll() {
   if (r.boot && r.boot.written && r.boot.written.length) lines.push(el("p", { class: "muted" }, "Boot partition: " + r.boot.written.join(", ")));
   if (state.sshLogin) lines.push(el("p", {}, "After first boot, log in with the user’s password: ", el("span", { class: "mono" }, state.sshLogin)));
   for (const w of (r.boot && r.boot.warnings) || []) lines.push(el("p", { class: "banner warn" }, w));
+  if (r.grow_note) lines.push(el("p", { class: "banner warn" }, r.grow_note));
+  else if (r.root_partition) lines.push(el("p", { class: "muted" }, "Root filesystem extended to the card."));
   $("result").replaceChildren(...lines);
 }
 
@@ -443,7 +558,11 @@ async function startOver() {
     if (e.type === "checkbox" || e.type === "radio") e.checked = e.defaultChecked;
     else e.value = e.defaultValue;
   });
-  document.querySelectorAll(".reveal").forEach((b) => { $(b.dataset.for).type = "password"; b.textContent = "Show"; });
+  document.querySelectorAll(".reveal").forEach((b) => {
+    const input = $(b.getAttribute("data-field"));
+    if (input) input.type = "password";
+    b.textContent = "Show";
+  });
   $("server").value = state.server || prefs.server_url || "";
   $("insecure").checked = state.insecure;
   applyPrefs(prefs);
@@ -452,7 +571,9 @@ async function startOver() {
   syncSettingsFields();
   showProblems([]);
   setSettingsTab("general");
-  Object.assign(state, { imageId: null, device: null, devices: [], images: [] });
+  Object.assign(state, { imageId: null, device: null, devices: [], images: [], importedPasswordHash: "" });
+  const importStatus = $("import-status");
+  if (importStatus) { importStatus.hidden = true; importStatus.textContent = ""; }
   setSource("server");
   if ($("server").value) loadImages();
   else $("images").replaceChildren();
@@ -468,8 +589,11 @@ function applyPrefs(p) {
   $("country").value = p.wifi_country || guessCountry();
   $("hostname").value = p.hostname || "";
   $("timezone").value = p.timezone || "";
-  $("user-name").value = p.user_name || "";
-  $("use-user").checked = !!p.user_name;
+  // Saved username turns the section on; otherwise keep HTML defaults (user on, "pi").
+  if (p.user_name) {
+    $("user-name").value = p.user_name;
+    $("use-user").checked = true;
+  }
   // SSH with password login is on unless it was turned off last time.
   $("use-ssh").checked = p.ssh_enabled !== false;
   $(p.ssh_password_authentication === false ? "ssh-auth-key" : "ssh-auth-password").checked = true;
@@ -479,10 +603,12 @@ function applyPrefs(p) {
 // Show only the fields of the ticked sections.
 function syncSettingsFields() {
   for (const [box, fields] of [["use-enroll", "enroll-fields"], ["use-wifi", "wifi-fields"],
-    ["use-user", "user-fields"], ["use-ssh", "ssh-fields"]]) {
+    ["use-ssh", "ssh-fields"]]) {
     $(fields).hidden = !$(box).checked;
   }
+  $("user-fields").hidden = !$("use-ssh").checked || !$("use-user").checked;
   $("ssh-key-optional").hidden = $("ssh-auth-key").checked;
+  updatePasswordHashNote();
 }
 
 // ---------- wiring ----------
@@ -529,17 +655,60 @@ async function init() {
   syncSettingsFields();
   $("tab-general").onclick = () => setSettingsTab("general");
   $("tab-meteor").onclick = () => setSettingsTab("meteor");
+  $("user-password").addEventListener("input", () => {
+    if ($("user-password").value) state.importedPasswordHash = "";
+    updatePasswordHashNote();
+  });
+  $("import-meteorenv").addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const map = parseMeteorenv(text);
+      if (!Object.keys(map).length) {
+        $("import-status").hidden = false;
+        $("import-status").textContent = "That file had no KEY=value settings.";
+        return;
+      }
+      applyMeteorenv(map);
+    } catch (e) {
+      $("import-status").hidden = false;
+      $("import-status").textContent = e.message || "Could not read that file.";
+    }
+  });
   $("mode-write").onclick = () => setMode("write");
   $("mode-backup").onclick = () => setMode("backup");
   $("backup-refresh").onclick = loadBackupDevices;
   $("backup-show-all").onchange = loadBackupDevices;
   $("backup-out").addEventListener("input", renderBackupDevices);
   $("backup-start").onclick = startBackup;
+  // data-field (not data-for): dataset.for is unreliable in some browsers.
   document.querySelectorAll(".reveal").forEach((b) => {
-    b.onclick = () => {
-      const input = $(b.dataset.for);
+    b.onclick = (event) => {
+      event.preventDefault();
+      const id = b.getAttribute("data-field");
+      const input = id && $(id);
+      if (!input) return;
       input.type = input.type === "password" ? "text" : "password";
       b.textContent = input.type === "password" ? "Show" : "Hide";
+    };
+  });
+  document.querySelectorAll(".generate").forEach((b) => {
+    b.onclick = (event) => {
+      event.preventDefault();
+      const id = b.getAttribute("data-field");
+      const input = id && $(id);
+      if (!input) return;
+      input.value = generatePassword(16);
+      input.type = "text";
+      input.focus();
+      const reveal = document.querySelector(`.reveal[data-field="${id}"]`);
+      if (reveal) reveal.textContent = "Hide";
+      if (id === "user-password") {
+        state.importedPasswordHash = "";
+        updatePasswordHashNote();
+      }
     };
   });
   $("next-2").onclick = () => {
