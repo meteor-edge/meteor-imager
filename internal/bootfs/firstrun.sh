@@ -15,8 +15,12 @@
 # the run can be repeated:  sudo bash /boot/firmware/meteor-firstrun.sh
 # Log: /var/log/meteor-firstrun.log (and /var/log/cloud-init-output.log).
 #
+# Works with the Go meteorcli (0.5+, identity in /var/lib/meteorcli/identity) and
+# the older Python one (identity in /etc/meteorcli).
+#
 # Environment overrides (tests and debugging): METEOR_BOOT_DIR, METEORCLI_CONFIG_DIR,
-# METEOR_INSTALL_URL, METEOR_FIRSTRUN_LOG, METEOR_RETRIES, METEOR_RETRY_SECONDS.
+# METEORCLI_IDENTITY_DIR, METEOR_INSTALL_URL, METEOR_FIRSTRUN_LOG, METEOR_RETRIES,
+# METEOR_RETRY_SECONDS, METEOR_FIRSTBOOT_UNIT, METEOR_SETTINGS_UNIT.
 set -uo pipefail
 
 # Everything runs from main(): bash has then read the whole file before this
@@ -30,10 +34,12 @@ main() {
 	ENV_FILE="${boot_dir}/.meteorenv"
 	LOG_FILE="${METEOR_FIRSTRUN_LOG:-/var/log/meteor-firstrun.log}"
 	export METEORCLI_CONFIG_DIR="${METEORCLI_CONFIG_DIR:-/etc/meteorcli}"
+	IDENTITY_DIR="${METEORCLI_IDENTITY_DIR:-/var/lib/meteorcli/identity}"
 	INSTALL_URL="${METEOR_INSTALL_URL:-https://github.com/meteor-edge/meteor-cloud/releases/latest/download/install-meteorcli.sh}"
 	RETRIES="${METEOR_RETRIES:-60}"
 	RETRY_SECONDS="${METEOR_RETRY_SECONDS:-10}"
 	FIRSTBOOT_UNIT="${METEOR_FIRSTBOOT_UNIT:-/etc/systemd/system/meteorcli-firstboot.service}"
+	SETTINGS_UNIT="${METEOR_SETTINGS_UNIT:-/etc/systemd/system/meteorcli-settings.service}"
 
 	if [[ "${EUID}" -ne 0 && -z "${METEOR_FIRSTRUN_ALLOW_NONROOT:-}" ]]; then
 		echo "meteor-firstrun: run as root: sudo bash $0" >&2
@@ -42,27 +48,31 @@ main() {
 
 	log "MeteorCloud first run (boot partition ${boot_dir})"
 
-	if [[ -s "${METEORCLI_CONFIG_DIR}/device-token" ]]; then
+	if enrolled; then
 		log "Already enrolled; nothing to request."
 		remove_firstrun
 		start_agent
 		return 0
 	fi
 
-	if [[ -s "${METEORCLI_CONFIG_DIR}/claim-secret" ]]; then
+	if request_pending; then
 		log "A token request was already sent; resuming."
 		remove_firstrun
 		start_agent
 		return 0
 	fi
 
-	# A Meteor base image enrolls with its own meteorcli-firstboot.service, which
-	# reads .meteorenv too. Two runs would race, so leave enrollment to it.
-	if [[ -f "${FIRSTBOOT_UNIT}" ]]; then
-		log "This image has MeteorCloud first boot (${FIRSTBOOT_UNIT}); it enrolls the device."
+	# A Meteor base image enrolls with its own first-boot service, which reads
+	# .meteorenv too (meteorcli-settings.service with the Go meteorcli,
+	# meteorcli-firstboot.service with the Python one). Two runs would race, so
+	# leave enrollment to it.
+	local unit
+	for unit in "${SETTINGS_UNIT}" "${FIRSTBOOT_UNIT}"; do
+		[[ -f "${unit}" ]] || continue
+		log "This image has MeteorCloud first boot (${unit}); it enrolls the device."
 		rm -f "${SELF}"
 		return 0
-	fi
+	done
 
 	read_meteorenv || return 1
 	ensure_meteorcli || return 1
@@ -71,6 +81,20 @@ main() {
 	remove_firstrun
 	start_agent
 	log "Done. Approve the device in MeteorCloud (Devices, pending enrollment)."
+}
+
+# The Go meteorcli keeps its identity in IDENTITY_DIR, the Python one in the config dir.
+enrolled() {
+	[[ -s "${IDENTITY_DIR}/device-token" || -s "${METEORCLI_CONFIG_DIR}/device-token" ]]
+}
+
+request_pending() {
+	[[ -s "${IDENTITY_DIR}/pending-claim.json" || -s "${METEORCLI_CONFIG_DIR}/claim-secret" ]]
+}
+
+# The Go meteorcli has `meteorcli agent`; its service asks for approval and waits for it.
+go_meteorcli() {
+	meteorcli agent --help >/dev/null 2>&1
 }
 
 log() {
@@ -139,7 +163,7 @@ request_token() {
 	local i
 	for ((i = 1; i <= RETRIES; i++)); do
 		if meteorcli request-token --name "${METEOR_NAME}" --wait 0; then
-			if [[ -s "${METEORCLI_CONFIG_DIR}/claim-secret" || -s "${METEORCLI_CONFIG_DIR}/device-token" ]]; then
+			if request_pending || enrolled; then
 				log "Token request sent."
 				return 0
 			fi
@@ -169,7 +193,13 @@ start_agent() {
 		return 0
 	fi
 	systemctl enable meteorcli.service >/dev/null 2>&1 || true
-	# meteorcli releases from November 2026 wait for approval in `meteorcli run`.
+	if go_meteorcli; then
+		systemctl enable meteorcli-helper.socket >/dev/null 2>&1 || true
+		systemctl restart meteorcli.service
+		log "meteorcli.service is waiting for approval: journalctl -u meteorcli -f"
+		return 0
+	fi
+	# Python meteorcli releases from November 2026 wait for approval in `meteorcli run`.
 	if COLUMNS=1000 meteorcli run --help 2>/dev/null | grep -q "waits for pending enrollment"; then
 		systemctl restart meteorcli.service
 		log "meteorcli.service is waiting for approval: journalctl -u meteorcli -f"

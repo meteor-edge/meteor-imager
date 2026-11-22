@@ -15,10 +15,12 @@ type firstrunEnv struct {
 	t       *testing.T
 	boot    string
 	config  string
+	ident   string // the Go meteorcli's identity directory
 	bin     string
 	calls   string
 	logFile string
 	unit    string // meteorcli-firstboot.service of a base image; absent by default
+	setUnit string // meteorcli-settings.service of a Go base image; absent by default
 }
 
 const testKey = "key_supersecret123"
@@ -36,12 +38,14 @@ func newFirstrunEnv(t *testing.T) *firstrunEnv {
 		t:       t,
 		boot:    filepath.Join(dir, "boot"),
 		config:  filepath.Join(dir, "etc-meteorcli"),
+		ident:   filepath.Join(dir, "var-lib-meteorcli-identity"),
 		bin:     filepath.Join(dir, "bin"),
 		calls:   filepath.Join(dir, "calls.log"),
 		logFile: filepath.Join(dir, "firstrun.log"),
 		unit:    filepath.Join(dir, "meteorcli-firstboot.service"),
+		setUnit: filepath.Join(dir, "meteorcli-settings.service"),
 	}
-	for _, d := range []string{e.boot, e.config, e.bin} {
+	for _, d := range []string{e.boot, e.config, e.ident, e.bin} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -77,8 +81,23 @@ func (e *firstrunEnv) meteorcli(requestOK, newRun bool) {
 case "$1" in
   --version) echo "meteorcli 0.1.0" ;;
   run) echo "`+help+`" ;;
+  agent) echo "unknown command: agent" >&2; exit 2 ;;
   request-token)
     `+map[bool]string{true: `echo '{"request_id":"r","claim_secret":"c"}' >"$METEORCLI_CONFIG_DIR/claim-secret"`, false: `echo "error: enrollment request failed" >&2; exit 1`}[requestOK]+` ;;
+esac
+exit 0
+`)
+}
+
+// goMeteorcli stubs the Go meteorcli: it has `agent`, and request-token
+// leaves the pending claim in its identity directory.
+func (e *firstrunEnv) goMeteorcli() {
+	e.stub("meteorcli", `echo "meteorcli $*" >>"$CALLS"
+case "$1" in
+  --version) echo "meteorcli 0.5.0" ;;
+  agent) echo "Usage: meteorcli agent [--debug]" ;;
+  run) echo "Usage: meteorcli agent [--debug]" ;;
+  request-token) echo '{"request_id":"r","claim_secret":"c"}' >"$METEORCLI_IDENTITY_DIR/pending-claim.json" ;;
 esac
 exit 0
 `)
@@ -93,6 +112,8 @@ func (e *firstrunEnv) run() (string, error) {
 		"CALLS=" + e.calls,
 		"METEOR_FIRSTRUN_ALLOW_NONROOT=1",
 		"METEORCLI_CONFIG_DIR=" + e.config,
+		"METEORCLI_IDENTITY_DIR=" + e.ident,
+		"METEOR_SETTINGS_UNIT=" + e.setUnit,
 		"METEOR_FIRSTRUN_LOG=" + e.logFile,
 		"METEOR_RETRIES=2",
 		"METEOR_RETRY_SECONDS=0",
@@ -246,5 +267,54 @@ func TestFirstrunLeavesEnrollmentToABaseImage(t *testing.T) {
 	}
 	if !e.bootHas(MeteorEnvFile) {
 		t.Error(".meteorenv must stay for meteorcli-firstboot")
+	}
+}
+
+func TestFirstrunWithGoMeteorcliWaitsInTheService(t *testing.T) {
+	e := newFirstrunEnv(t)
+	e.goMeteorcli()
+	out, err := e.run()
+	if err != nil {
+		t.Fatalf("firstrun failed: %v\n%s", err, out)
+	}
+	calls := e.callLog()
+	for _, want := range []string{
+		"meteorcli request-token --name pi-kitchen --wait 0",
+		"systemctl enable meteorcli-helper.socket",
+		"systemctl restart meteorcli.service",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("missing call %q in:\n%s", want, calls)
+		}
+	}
+	if strings.Contains(calls, "systemd-run") || strings.Count(calls, "request-token") != 1 {
+		t.Errorf("one request, no transient unit:\n%s", calls)
+	}
+	if e.bootHas(FirstrunFile) || e.bootHas(MeteorEnvFile) {
+		t.Error("script and .meteorenv must be removed after the token request")
+	}
+}
+
+func TestFirstrunGoMeteorcliAlreadyEnrolled(t *testing.T) {
+	e := newFirstrunEnv(t)
+	e.goMeteorcli()
+	e.write(filepath.Join(e.ident, "device-token"), "dev_x", 0o600)
+	if out, err := e.run(); err != nil || !strings.Contains(out, "Already enrolled") {
+		t.Fatalf("err=%v out=%s", err, out)
+	}
+	if strings.Contains(e.callLog(), "request-token") {
+		t.Errorf("an enrolled device must not ask again:\n%s", e.callLog())
+	}
+}
+
+func TestFirstrunLeavesEnrollmentToAGoBaseImage(t *testing.T) {
+	e := newFirstrunEnv(t)
+	e.goMeteorcli()
+	e.write(e.setUnit, "[Unit]\n", 0o644)
+	if out, err := e.run(); err != nil {
+		t.Fatalf("firstrun failed: %v\n%s", err, out)
+	}
+	if strings.Contains(e.callLog(), "request-token") || e.bootHas(FirstrunFile) || !e.bootHas(MeteorEnvFile) {
+		t.Errorf("must leave .meteorenv to meteorcli-settings:\n%s", e.callLog())
 	}
 }

@@ -100,8 +100,10 @@ Base images with MeteorCloud first boot preinstalled (meteor-cloud's
 Meteor Imager writes **only** `.meteorenv` (version 2, below) and leaves `user-data`,
 `network-config`, `meta-data` and `cmdline.txt` alone. The image's `meteorcli-settings.service`
 applies everything early in boot (Wi-Fi through NetworkManager, hostname, timezone, user, SSH),
-moves the enrollment values to `/etc/meteorcli-firstboot.env` (root only) and deletes `.meteorenv`
-from the card before the network starts. `meteorcli-firstboot.service` then sends one token request.
+moves the enrollment values to `/etc/meteorcli/meteorenv` (root only) and deletes `.meteorenv`
+from the card before the network starts. `meteorcli.service` (the Go meteorcli, 0.5+) applies that
+file and sends one token request. Images built for the older Python meteorcli moved them to
+`/etc/meteorcli-firstboot.env` for `meteorcli-firstboot.service` instead.
 Images made with meteor-cloud's `meteorcli-prepare-image.sh` (see [Golden images](#4-golden-images-back-up-a-prepared-card))
 are base images.
 
@@ -138,7 +140,7 @@ METEOR_API_KEY=key_...
 `meteor-firstrun.sh` reads it (the file is parsed, never sourced) and deletes it once the token
 request is sent. MeteorCloud's own first-boot
 scripts in golden images read `/boot/firmware/.meteorenv` too (see MeteorCloud's
-`src/device-plane/agent/packaging/firstboot/`).
+`src/device-plane/agent-go/packaging/firstboot/`).
 
 ### `meteor-firstrun.sh` (enrollment set, cloud-init images)
 
@@ -150,13 +152,16 @@ Embedded in Meteor Imager (`internal/bootfs/firstrun.sh`). cloud-init runs it on
    Retries for up to 10 minutes while the network comes up.
 3. `meteorcli config --domain … --api-key …`, then `meteorcli request-token --name <hostname> --wait 0`,
    retried for up to 10 minutes.
-4. **Only once the request is sent** (a claim secret is in `/etc/meteorcli`): deletes
+4. **Only once the request is sent** (a pending claim is in `/var/lib/meteorcli/identity`, or a
+   claim secret in `/etc/meteorcli` with the Python meteorcli): deletes
    `meteor-firstrun.sh` and `.meteorenv` from the boot partition, enables and restarts
    `meteorcli.service`.
 5. `meteorcli run` waits for the administrator to approve the request, then runs the agent. The wait
-   survives reboots, and an expired request is submitted again with the key `meteorcli` keeps in
-   `/etc/meteorcli/api-key` (root only). meteorcli releases without this wait get a transient
+   survives reboots, and an expired request is submitted again with the key `meteorcli` keeps
+   (root only). Older Python meteorcli releases without this wait get a transient
    `meteorcli-claim.service` instead (not kept across a reboot).
+   A base image with `meteorcli-settings.service` or `meteorcli-firstboot.service` enrolls by
+   itself: the script then only removes itself and leaves `.meteorenv` to that service.
 
 If no request could be sent, both files stay and the log says why. Fix `.meteorenv` and run
 `sudo bash /boot/firmware/meteor-firstrun.sh`. A run after the request was sent only removes the
