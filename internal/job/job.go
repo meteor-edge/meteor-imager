@@ -192,7 +192,7 @@ func Run(ctx context.Context, req Request, emit func(Event)) (*flash.Report, err
 	if rep.RootPartition > 0 {
 		emit(Event{Stage: StageGrow, Message: "Extending the root filesystem to the card"})
 		if gerr := flash.ResizeRoot(ctx, req.Device.Path, rep.RootPartition); gerr != nil {
-			rep.GrowNote = gerr.Error() + ". On the Pi: sudo raspi-config nonint do_expand_rootfs && sudo reboot"
+			rep.GrowNote = gerr.Error() + ". The partition already fills the card; on a Meteor image the Pi grows the filesystem on first boot. Otherwise run: sudo raspi-config nonint do_expand_rootfs && sudo reboot"
 			emit(Event{Stage: StageGrow, Fraction: 1, Message: rep.GrowNote})
 		} else {
 			emit(Event{Stage: StageGrow, Fraction: 1, Message: "Root filesystem extended to the card"})

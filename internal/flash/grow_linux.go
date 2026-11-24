@@ -9,17 +9,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/meteor-edge/meteor-imager/internal/devices"
+	"github.com/meteor-edge/meteor-imager/internal/diskimage"
 )
 
-// ResizeRoot grows the ext filesystem in an MBR slot to the partition size.
-// The disk must already be closed. A missing tool or a failed check is returned
-// to the caller; the card itself has already been written.
+// ResizeRoot grows the ext filesystem in an MBR slot to the partition size
+// written on the card. It sizes the loop device from the on-disk partition
+// table, not from the kernel's cached view, so a card that was just rewritten
+// still grows even when BLKRRPART leaves the old size in place. A missing tool
+// or a failed check is returned to the caller; the card itself has already
+// been written.
 func ResizeRoot(ctx context.Context, disk string, index int) error {
 	if !strings.HasPrefix(disk, "/dev/") || strings.Contains(disk, "..") {
 		return fmt.Errorf("not a device path: %s", disk)
@@ -35,36 +40,145 @@ func ResizeRoot(ctx context.Context, disk string, index int) error {
 	if err != nil {
 		return err
 	}
+	losetup, err := lookE2fs("losetup")
+	if err != nil {
+		// Older note said e2fsprogs; losetup is util-linux and always on a
+		// desktop that can write cards, but keep a clear message.
+		return fmt.Errorf("losetup is not installed; apt install util-linux")
+	}
 	if err := unmountAll(ctx, devices.Device{Path: disk}); err != nil {
 		return err
 	}
-	if err := rereadPartitions(ctx, disk); err != nil {
-		return err
-	}
-	// The desktop may mount the fresh boot partition the moment the table is reread.
+	// Best-effort: free kernel partition nodes so nothing holds the card.
+	_ = rereadPartitions(ctx, disk)
 	if err := unmountAll(ctx, devices.Device{Path: disk}); err != nil {
 		return err
 	}
-	part := partitionNode(disk, index)
-	if err := waitForNode(ctx, part); err != nil {
+
+	part, err := mbrPartition(disk, index)
+	if err != nil {
 		return err
 	}
-	out, code, err := runTool(ctx, e2fsck, "-fp", part)
+	loop, err := attachLoop(ctx, losetup, disk, part.Offset(), part.Size())
+	if err != nil {
+		return err
+	}
+	defer detachLoop(ctx, losetup, loop)
+
+	out, code, err := runTool(ctx, e2fsck, "-fp", loop)
 	if err != nil {
 		return err
 	}
 	// 0 clean, 1 errors fixed, 2 fixed and a reboot was advised.
 	if code > 2 {
-		return fmt.Errorf("e2fsck %s exited %d: %s", part, code, lastLine(out))
+		return fmt.Errorf("e2fsck %s exited %d: %s", loop, code, lastLine(out))
 	}
-	out, code, err = runTool(ctx, resize, part)
+	out, code, err = runTool(ctx, resize, loop)
 	if err != nil {
 		return err
 	}
 	if code != 0 {
-		return fmt.Errorf("resize2fs %s exited %d: %s", part, code, lastLine(out))
+		return fmt.Errorf("resize2fs %s exited %d: %s", loop, code, lastLine(out))
+	}
+	if err := verifyExtSize(ctx, loop, part.Size()); err != nil {
+		return err
 	}
 	return nil
+}
+
+// mbrPartition reads the on-disk MBR entry for index (1-based).
+func mbrPartition(disk string, index int) (diskimage.Partition, error) {
+	f, err := os.Open(disk)
+	if err != nil {
+		return diskimage.Partition{}, fmt.Errorf("read partition table on %s: %w", disk, err)
+	}
+	defer f.Close()
+	parts, err := diskimage.ReadPartitions(f)
+	if err != nil {
+		return diskimage.Partition{}, err
+	}
+	for _, p := range parts {
+		if p.Index == index {
+			if len(p.Type) != 2 || p.Type != "83" {
+				return diskimage.Partition{}, fmt.Errorf("partition %d is type %s, not Linux", index, p.Type)
+			}
+			if p.Size() <= 0 {
+				return diskimage.Partition{}, fmt.Errorf("partition %d has no size", index)
+			}
+			return p, nil
+		}
+	}
+	return diskimage.Partition{}, fmt.Errorf("partition %d not found on %s", index, disk)
+}
+
+func attachLoop(ctx context.Context, losetup, disk string, offset, size int64) (string, error) {
+	out, code, err := runTool(ctx, losetup, "-f", "--show", "-o", strconv.FormatInt(offset, 10),
+		"--sizelimit", strconv.FormatInt(size, 10), disk)
+	if err != nil {
+		return "", err
+	}
+	if code != 0 {
+		return "", fmt.Errorf("losetup exited %d: %s", code, lastLine(out))
+	}
+	loop := strings.TrimSpace(out)
+	if !strings.HasPrefix(loop, "/dev/loop") {
+		return "", fmt.Errorf("losetup returned %q", loop)
+	}
+	if err := waitForNode(ctx, loop); err != nil {
+		_ = detachLoop(ctx, losetup, loop)
+		return "", err
+	}
+	return loop, nil
+}
+
+func detachLoop(ctx context.Context, losetup, loop string) error {
+	_, _, err := runTool(ctx, losetup, "-d", loop)
+	return err
+}
+
+// verifyExtSize checks that the filesystem now fills the partition (within one
+// block). Catches the failure mode where resize2fs exits 0 because the kernel
+// still exposed the old, smaller partition size.
+func verifyExtSize(ctx context.Context, dev string, wantBytes int64) error {
+	dump, err := lookE2fs("dumpe2fs")
+	if err != nil {
+		return err
+	}
+	out, code, err := runTool(ctx, dump, "-h", dev)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("dumpe2fs %s exited %d: %s", dev, code, lastLine(out))
+	}
+	bs, blocks := extField(out, "Block size:"), extField(out, "Block count:")
+	if bs <= 0 || blocks <= 0 {
+		return errors.New("dumpe2fs: no block size or count")
+	}
+	got := bs * blocks
+	if got < wantBytes-bs || got > wantBytes {
+		return fmt.Errorf("filesystem is %d bytes after resize, partition is %d; the card did not take the new size", got, wantBytes)
+	}
+	return nil
+}
+
+func extField(out, label string) int64 {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, label) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		n, err := strconv.ParseInt(fields[len(fields)-1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 func rereadPartitions(ctx context.Context, disk string) error {

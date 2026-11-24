@@ -36,11 +36,21 @@
   <section id="step-1" class="card">
     <h1>Choose an OS image</h1>
     <div class="tabs" role="tablist">
-      <button role="tab" id="tab-server" aria-selected="true" type="button">From MeteorCloud</button>
-      <button role="tab" id="tab-file" aria-selected="false" type="button">Local file</button>
+      <button role="tab" id="tab-file" aria-selected="true" type="button">Local file</button>
+      <button role="tab" id="tab-server" aria-selected="false" type="button">From MeteorCloud</button>
     </div>
 
-    <div id="pane-server">
+    <div id="pane-file">
+      <label for="file-path">Image file (.img, .img.xz, .gz or .zip)</label>
+      <div class="row">
+        <input id="file-path" placeholder="/path/to/raspios.img.xz" spellcheck="false">
+        <button id="browse" type="button">Browse…</button>
+      </div>
+      <p class="hint">Any Raspberry Pi OS image, or a backup made with <strong>Back up a card</strong>
+        (<span class="mono">.img</span> / <span class="mono">.img.gz</span>). Settings on the next step are optional.</p>
+    </div>
+
+    <div id="pane-server" hidden>
       <label for="server">MeteorCloud address</label>
       <div class="row">
         <input id="server" placeholder="fleet.example.com or 192.168.0.10:8000" autocomplete="url" spellcheck="false">
@@ -51,23 +61,13 @@
       <div id="images" class="list" role="radiogroup" aria-label="OS images"></div>
     </div>
 
-    <div id="pane-file" hidden>
-      <label for="file-path">Image file (.img, .img.xz, .gz or .zip)</label>
-      <div class="row">
-        <input id="file-path" placeholder="/path/to/raspios.img.xz" spellcheck="false">
-        <button id="browse" type="button">Browse…</button>
-      </div>
-      <p class="hint">A backup made with <strong>Back up a card</strong> (<span class="mono">.img</span> or
-        <span class="mono">.img.gz</span>) works too. Your settings are applied to each card you write from it.</p>
-    </div>
-
     <div class="actions"><button id="next-1" class="primary" type="button" disabled>Next</button></div>
   </section>
 
   <!-- 2. Settings -->
   <section id="step-2" class="card" hidden>
     <h1>Card settings</h1>
-    <p class="hint">First configure the card like Raspberry Pi Imager (Wi-Fi, user, SSH). MeteorCloud enrollment is optional. Written to the card’s boot partition; secrets are not sent to the server. Tick “Remember” only for non-secret fields.</p>
+    <p class="hint">All settings are optional. Leave every box unchecked to write the image unchanged. Tick Wi-Fi, SSH or MeteorCloud only when you want them. Secrets stay on this computer and the card’s boot partition; they are not sent to a server. Tick “Remember” only for non-secret fields.</p>
 
     <div class="import-box">
       <div class="row between">
@@ -102,7 +102,7 @@
     </div>
 
     <fieldset>
-      <legend><label class="check"><input type="checkbox" id="use-wifi" checked> Configure wireless LAN</label></legend>
+      <legend><label class="check"><input type="checkbox" id="use-wifi"> Configure wireless LAN</label></legend>
       <div id="wifi-fields">
         <label for="ssid">SSID</label>
         <input id="ssid" autocomplete="off" spellcheck="false">
@@ -124,9 +124,9 @@
     </fieldset>
 
     <fieldset>
-      <legend><label class="check"><input type="checkbox" id="use-ssh" checked> Enable SSH access</label></legend>
+      <legend><label class="check"><input type="checkbox" id="use-ssh"> Enable SSH access</label></legend>
       <div id="ssh-fields">
-        <label class="check"><input type="checkbox" id="use-user" checked> Set SSH username and password</label>
+        <label class="check"><input type="checkbox" id="use-user"> Set SSH username and password</label>
         <div id="user-fields">
           <label for="user-name">Username</label>
           <input id="user-name" value="pi" placeholder="pi" autocomplete="off" spellcheck="false" autocapitalize="off">
@@ -149,7 +149,7 @@
     </div>
 
     <div id="pane-meteor" hidden>
-    <p class="hint">Not required for Wi-Fi or SSH. Turn this on to put enrollment settings on the card so the device can request a token on first boot. Upload a settings file above, or fill the boxes below.</p>
+    <p class="hint">Optional. Leave this off to write a normal OS image with no MeteorCloud enrollment. Turn it on only when the device should request a token on first boot. Upload a settings file above, or fill the boxes below.</p>
     <fieldset>
       <legend><label class="check"><input type="checkbox" id="use-enroll"> Register this device with MeteorCloud on first boot</label></legend>
       <div id="enroll-fields">

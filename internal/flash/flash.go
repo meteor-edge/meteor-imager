@@ -199,6 +199,17 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 	if index, sectors, ok := diskimage.GrowLinuxRoot(head, capacity); ok {
 		rep.RootPartition = index
 		rep.RootSectors = uint64(sectors)
+		// Marker for first boot if write-time filesystem grow cannot run
+		// (macOS, missing tools, or a stale kernel partition size).
+		if vol, err := bootfs.OpenBoot(ov); err == nil {
+			if werr := vol.WriteFile(bootfs.ExpandRootfsFile, []byte{}); werr == nil {
+				if rep.Boot == nil {
+					rep.Boot = &bootfs.Result{}
+				}
+				rep.Boot.Written = append(rep.Boot.Written, bootfs.ExpandRootfsFile)
+			}
+			_ = vol.Close()
+		}
 	}
 
 	// 4. Partition table last, then confirm everything since step 2 landed.
