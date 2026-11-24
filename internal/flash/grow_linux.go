@@ -19,14 +19,17 @@ import (
 	"github.com/meteor-edge/meteor-imager/internal/diskimage"
 )
 
-// ResizeRoot grows the ext filesystem in an MBR slot to the partition size
-// written on the card. It sizes the loop device from the on-disk partition
-// table, not from the kernel's cached view, so a card that was just rewritten
-// still grows even when BLKRRPART leaves the old size in place. A missing tool
-// or a failed check is returned to the caller; the card itself has already
-// been written.
+// ResizeRoot grows the ext filesystem of an MBR Linux slot so it fills that
+// partition on the card (or image file). A small image written to a larger card
+// ends with a root filesystem that uses the whole card, not the image size.
+//
+// The loop device is sized from the on-disk partition table, not from the
+// kernel's cached partition nodes, so a card that was just rewritten still
+// grows when BLKRRPART leaves the old size in place. A missing tool or a
+// failed check is returned to the caller; the card itself has already been
+// written.
 func ResizeRoot(ctx context.Context, disk string, index int) error {
-	if !strings.HasPrefix(disk, "/dev/") || strings.Contains(disk, "..") {
+	if disk == "" || strings.Contains(disk, "..") {
 		return fmt.Errorf("not a device path: %s", disk)
 	}
 	if index < 1 || index > 4 {
@@ -40,19 +43,19 @@ func ResizeRoot(ctx context.Context, disk string, index int) error {
 	if err != nil {
 		return err
 	}
-	losetup, err := lookE2fs("losetup")
+	losetup, err := lookTool("losetup")
 	if err != nil {
-		// Older note said e2fsprogs; losetup is util-linux and always on a
-		// desktop that can write cards, but keep a clear message.
 		return fmt.Errorf("losetup is not installed; apt install util-linux")
 	}
-	if err := unmountAll(ctx, devices.Device{Path: disk}); err != nil {
-		return err
-	}
-	// Best-effort: free kernel partition nodes so nothing holds the card.
-	_ = rereadPartitions(ctx, disk)
-	if err := unmountAll(ctx, devices.Device{Path: disk}); err != nil {
-		return err
+	if strings.HasPrefix(disk, "/dev/") {
+		if err := unmountAll(ctx, devices.Device{Path: disk}); err != nil {
+			return err
+		}
+		// Best-effort: free kernel partition nodes so nothing holds the card.
+		_ = rereadPartitions(ctx, disk)
+		if err := unmountAll(ctx, devices.Device{Path: disk}); err != nil {
+			return err
+		}
 	}
 
 	part, err := mbrPartition(disk, index)
@@ -118,7 +121,7 @@ func attachLoop(ctx context.Context, losetup, disk string, offset, size int64) (
 		return "", err
 	}
 	if code != 0 {
-		return "", fmt.Errorf("losetup exited %d: %s", code, lastLine(out))
+		return "", fmt.Errorf("losetup exited %d: %s (need root to grow the filesystem on the card)", code, lastLine(out))
 	}
 	loop := strings.TrimSpace(out)
 	if !strings.HasPrefix(loop, "/dev/loop") {
@@ -204,7 +207,7 @@ func waitForNode(ctx context.Context, path string) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%s did not appear after the partition table was reread", path)
+			return fmt.Errorf("%s did not appear", path)
 		}
 		select {
 		case <-ctx.Done():
@@ -215,6 +218,10 @@ func waitForNode(ctx context.Context, path string) error {
 }
 
 func lookE2fs(name string) (string, error) {
+	return lookTool(name)
+}
+
+func lookTool(name string) (string, error) {
 	if p, err := exec.LookPath(name); err == nil {
 		return p, nil
 	}
@@ -223,6 +230,9 @@ func lookE2fs(name string) (string, error) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p, nil
 		}
+	}
+	if name == "losetup" {
+		return "", fmt.Errorf("losetup is not installed; apt install util-linux")
 	}
 	return "", fmt.Errorf("e2fsprogs is not installed (%s); apt install e2fsprogs", name)
 }

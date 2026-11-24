@@ -68,8 +68,12 @@ type Report struct {
 	// RootPartition is the 1-based MBR slot extended to the card, or 0 when
 	// the image was written as-is (unknown size, GPT, or no spare space).
 	RootPartition int `json:"root_partition,omitempty"`
+	// RootStartSector is that partition's first sector (unchanged by the grow).
+	RootStartSector uint64 `json:"root_start_sector,omitempty"`
 	// RootSectors is that partition's new length in 512-byte sectors.
 	RootSectors uint64 `json:"root_sectors,omitempty"`
+	// RootHadSectors is the partition length before it was extended (image size).
+	RootHadSectors uint64 `json:"root_had_sectors,omitempty"`
 	// GrowNote is set when the partition was extended but the filesystem was not.
 	GrowNote string `json:"grow_note,omitempty"`
 }
@@ -196,19 +200,23 @@ func Write(ctx context.Context, src *diskimage.Source, tgt Target, capacity int6
 
 	// Extend the last Linux partition to the card. The hash above used the
 	// original table, so this only changes the sector count written last.
-	if index, sectors, ok := diskimage.GrowLinuxRoot(head, capacity); ok {
-		rep.RootPartition = index
-		rep.RootSectors = uint64(sectors)
-		// Marker for first boot if write-time filesystem grow cannot run
-		// (macOS, missing tools, or a stale kernel partition size).
-		if vol, err := bootfs.OpenBoot(ov); err == nil {
-			if werr := vol.WriteFile(bootfs.ExpandRootfsFile, []byte{}); werr == nil {
-				if rep.Boot == nil {
-					rep.Boot = &bootfs.Result{}
+	if start, had, err := linuxRootLayout(head); err == nil {
+		if index, sectors, ok := diskimage.GrowLinuxRoot(head, capacity); ok {
+			rep.RootPartition = index
+			rep.RootStartSector = start
+			rep.RootSectors = uint64(sectors)
+			rep.RootHadSectors = had
+			// Marker for first boot if write-time filesystem grow cannot run
+			// (macOS, missing tools, or a stale kernel partition size).
+			if vol, err := bootfs.OpenBoot(ov); err == nil {
+				if werr := vol.WriteFile(bootfs.ExpandRootfsFile, []byte{}); werr == nil {
+					if rep.Boot == nil {
+						rep.Boot = &bootfs.Result{}
+					}
+					rep.Boot.Written = append(rep.Boot.Written, bootfs.ExpandRootfsFile)
 				}
-				rep.Boot.Written = append(rep.Boot.Written, bootfs.ExpandRootfsFile)
+				_ = vol.Close()
 			}
-			_ = vol.Close()
 		}
 	}
 
@@ -294,3 +302,21 @@ func writeFraction(src *diskimage.Source, written int64) float64 {
 }
 
 func human(n int64) string { return fmt.Sprintf("%.1f GB", float64(n)/1e9) }
+
+// linuxRootLayout is the start and length of the last MBR Linux partition in head.
+func linuxRootLayout(head []byte) (start, sectors uint64, err error) {
+	parts, err := diskimage.ReadPartitions(bytes.NewReader(head))
+	if err != nil || len(parts) == 0 {
+		return 0, 0, err
+	}
+	last := parts[0]
+	for _, p := range parts[1:] {
+		if p.Offset() > last.Offset() {
+			last = p
+		}
+	}
+	if len(last.Type) != 2 || last.Type != "83" {
+		return 0, 0, fmt.Errorf("last partition is type %s", last.Type)
+	}
+	return last.StartSector, last.Sectors, nil
+}
