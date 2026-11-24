@@ -171,6 +171,9 @@ func TestWriteVerifyConfigure(t *testing.T) {
 	if err != nil || written[1].Sectors != rep.RootSectors || written[0].Sectors != 131072 {
 		t.Fatalf("written table = %+v, %v", written, err)
 	}
+	if _, err := v.ReadFile(bootfs.ExpandRootfsFile); err != nil {
+		t.Fatalf("meteor-expand-rootfs missing after grow: %v", err)
+	}
 }
 
 func TestWriteDetectsBadCard(t *testing.T) {

@@ -23,6 +23,10 @@ const (
 	CmdlineFile       = "cmdline.txt"
 	WPASupplicantFile = "wpa_supplicant.conf"
 	FirstrunFile      = "meteor-firstrun.sh"
+	// ExpandRootfsFile asks meteorcli-settings on the Pi to grow the root
+	// filesystem once when write-time resize2fs could not (macOS, missing
+	// tools, or a kernel that still showed the old partition size).
+	ExpandRootfsFile = "meteor-expand-rootfs"
 	// UserconfFile and SSHFile are the legacy Raspberry Pi OS first-boot files
 	// (images without cloud-init): "name:crypt-hash" and an empty file that
 	// turns SSH on.

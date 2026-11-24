@@ -183,20 +183,28 @@ func Run(ctx context.Context, req Request, emit func(Event)) (*flash.Report, err
 		SyncEvery:  flash.DeviceSyncEvery,
 		Progress:   func(s flash.Stage, f float64, n int64) { emit(Event{Stage: string(s), Fraction: f, Bytes: n}) },
 	})
+	// Grow while the exclusive open still holds the card. A 1.5 GB image on a
+	// 16 GB card must end with root filling the card, not the image size.
+	// ResizeRootThrough uses the open handle (works via udisks, no root);
+	// losetup is a fallback when that path is unavailable.
+	if err == nil && rep != nil && rep.RootPartition > 0 && rep.RootHadSectors > 0 {
+		emit(Event{Stage: StageGrow, Message: "Extending the root filesystem to the card"})
+		gerr := flash.ResizeRootThrough(ctx, tgt, rep.RootStartSector, rep.RootHadSectors, rep.RootSectors)
+		if gerr != nil {
+			gerr = flash.ResizeRoot(ctx, req.Device.Path, rep.RootPartition)
+		}
+		if gerr != nil {
+			rep.GrowNote = gerr.Error() + ". The partition already fills the card; on a Meteor image the Pi grows the filesystem on first boot. Otherwise run: sudo raspi-config nonint do_expand_rootfs && sudo reboot"
+			emit(Event{Stage: StageGrow, Fraction: 1, Message: rep.GrowNote})
+		} else {
+			emit(Event{Stage: StageGrow, Fraction: 1, Message: "Root filesystem extended to the card"})
+		}
+	}
 	if cerr := tgt.Close(); err == nil && cerr != nil {
 		err = fmt.Errorf("close %s: %w", req.Device.Path, cerr)
 	}
 	if err != nil {
 		return nil, err
-	}
-	if rep.RootPartition > 0 {
-		emit(Event{Stage: StageGrow, Message: "Extending the root filesystem to the card"})
-		if gerr := flash.ResizeRoot(ctx, req.Device.Path, rep.RootPartition); gerr != nil {
-			rep.GrowNote = gerr.Error() + ". On the Pi: sudo raspi-config nonint do_expand_rootfs && sudo reboot"
-			emit(Event{Stage: StageGrow, Fraction: 1, Message: rep.GrowNote})
-		} else {
-			emit(Event{Stage: StageGrow, Fraction: 1, Message: "Root filesystem extended to the card"})
-		}
 	}
 	if !req.NoEject {
 		emit(Event{Stage: StageEject})

@@ -14,15 +14,15 @@ import (
 	"github.com/meteor-edge/meteor-imager/internal/diskimage"
 )
 
-// A small Pi-shaped image: FAT boot, a second FAT partition we also use
-// (settings), and an ext4 root. Writing it to a larger card must leave the
-// first two partitions alone and grow root to the card.
+// A small Pi-shaped image (~16 MiB root) written to a larger card must leave
+// the boot partitions alone and grow both the root partition and the ext4
+// filesystem to the card — the same path as a 1.5 GB backup on a 16 GB card.
 func TestWriteFitsRootToTheCard(t *testing.T) {
 	mkfs := findTool(t, "mkfs.ext4")
-	e2fsck := findTool(t, "e2fsck")
-	resize := findTool(t, "resize2fs")
 	debugfs := findTool(t, "debugfs")
 	dumpe2fs := findTool(t, "dumpe2fs")
+	_ = findTool(t, "e2fsck")
+	_ = findTool(t, "resize2fs")
 
 	const (
 		bootStart   = 8192
@@ -88,6 +88,20 @@ func TestWriteFitsRootToTheCard(t *testing.T) {
 	if parts[2].Sectors != end-uint64(rootStart) {
 		t.Fatalf("root sectors = %d, want %d", parts[2].Sectors, end-uint64(rootStart))
 	}
+	if parts[2].Size() <= int64(rootSectors)*diskimage.SectorSize {
+		t.Fatalf("root partition did not grow past the small image (%d bytes)", parts[2].Size())
+	}
+
+	// Same path the writer uses on a real card (open handle, no root/losetup).
+	cardRW, err := os.OpenFile(cardPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ResizeRootThrough(context.Background(), fileTarget{cardRW}, rep.RootStartSector, rep.RootHadSectors, rep.RootSectors); err != nil {
+		cardRW.Close()
+		t.Fatalf("ResizeRootThrough: %v", err)
+	}
+	cardRW.Close()
 
 	grown := filepath.Join(t.TempDir(), "root-grown.img")
 	part := make([]byte, parts[2].Size())
@@ -97,14 +111,6 @@ func TestWriteFitsRootToTheCard(t *testing.T) {
 	if err := os.WriteFile(grown, part, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command(e2fsck, "-fp", grown).CombinedOutput(); err != nil {
-		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() > 2 {
-			t.Fatalf("e2fsck: %v %s", err, out)
-		}
-	}
-	if out, err := exec.Command(resize, grown).CombinedOutput(); err != nil {
-		t.Fatalf("resize2fs: %v %s", err, out)
-	}
 	info, err := exec.Command(dumpe2fs, "-h", grown).CombinedOutput()
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +119,7 @@ func TestWriteFitsRootToTheCard(t *testing.T) {
 	blocks := mustMatch(t, `(?m)^Block count:\s*(\d+)`, info)
 	got := bs * blocks
 	if got < parts[2].Size()-bs || got > parts[2].Size() {
-		t.Fatalf("filesystem is %d bytes, partition is %d", got, parts[2].Size())
+		t.Fatalf("filesystem is %d bytes after writing a small image to a %d-byte card; partition is %d", got, card, parts[2].Size())
 	}
 	cat, err := exec.Command(debugfs, "-R", "cat hello.txt", grown).CombinedOutput()
 	if err != nil || !bytes.Contains(cat, []byte("kept on the grown card")) {

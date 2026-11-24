@@ -316,7 +316,9 @@ To publish an image with Docker, packages and `meteorcli` already installed:
    `meteor-imager backup --device /dev/sdX --out pi-golden.img.gz`.
 4. Upload the file to MeteorCloud as an `os_image` and publish it.
 5. Write cards from it with the General and MeteorCloud settings. On Linux the imager extends the
-   last Linux partition to the card and grows the ext4 filesystem when e2fsprogs is installed.
+   last Linux partition to the card, writes `meteor-expand-rootfs` on the boot partition, and
+   grows the ext4 filesystem on Linux (loop device + e2fsprogs) so a stale kernel partition
+   size cannot leave root small.
    Each card creates new SSH host keys and a new machine-id, applies `.meteorenv` and sends one
    token request. A prepared image also grows the filesystem on first boot if the write could not.
 

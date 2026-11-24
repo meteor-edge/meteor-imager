@@ -5,7 +5,7 @@
 
 const $ = (id) => document.getElementById(id);
 const state = {
-  source: "server", // or "file"
+  source: "file", // or "server"
   server: null, insecure: false, images: [], imageId: null,
   devices: [], device: null,
   step: 1,
@@ -574,7 +574,7 @@ async function startOver() {
   Object.assign(state, { imageId: null, device: null, devices: [], images: [], importedPasswordHash: "" });
   const importStatus = $("import-status");
   if (importStatus) { importStatus.hidden = true; importStatus.textContent = ""; }
-  setSource("server");
+  setSource("file");
   if ($("server").value) loadImages();
   else $("images").replaceChildren();
   state.step = 1;
@@ -589,14 +589,12 @@ function applyPrefs(p) {
   $("country").value = p.wifi_country || guessCountry();
   $("hostname").value = p.hostname || "";
   $("timezone").value = p.timezone || "";
-  // Saved username turns the section on; otherwise keep HTML defaults (user on, "pi").
+  // Saved username fills the box; the SSH sections stay off unless the user ticks them.
   if (p.user_name) {
     $("user-name").value = p.user_name;
-    $("use-user").checked = true;
   }
-  // SSH with password login is on unless it was turned off last time.
-  $("use-ssh").checked = p.ssh_enabled !== false;
-  $(p.ssh_password_authentication === false ? "ssh-auth-key" : "ssh-auth-password").checked = true;
+  if (p.ssh_password_authentication === false) $("ssh-auth-key").checked = true;
+  else $("ssh-auth-password").checked = true;
   $("ssh-key").value = p.ssh_authorized_key || "";
 }
 
@@ -633,6 +631,7 @@ async function init() {
   if (!$("timezone").value) {
     try { $("timezone").placeholder = Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Berlin"; } catch (_) { /* ignore */ }
   }
+  setSource("file");
   if (p.server_url) loadImages();
 
   $("tab-server").onclick = () => setSource("server");

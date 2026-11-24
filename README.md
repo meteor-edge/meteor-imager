@@ -185,12 +185,15 @@ first boot preinstalled in the image. The full format is in [docs/contract.md](d
 2. Verify: the card is read back (page cache dropped) and its SHA-256 compared with what was written.
 3. The boot partition is edited in place with a userspace FAT driver: no mounting and no root.
 4. The last Linux partition (MBR type 83) is extended to a 4 MiB boundary at the end of the
-   card. The boot partition stays the size it has in the image. GPT images are written as they are.
+   card, even when the image is much smaller (a 1.5 GB backup on a 16 GB card). The boot
+   partition stays the size it has in the image. GPT images are written as they are.
 5. The partition table goes last, and the changed sectors are read back. Until this step the OS
    sees an empty card, so it never mounts or locks a half-written card.
-6. On Linux, with e2fsprogs installed, the ext4 filesystem is grown to that partition
-   (`e2fsck -fp`, then `resize2fs`). The card is already written if this step cannot run; the
-   Pi can still grow the filesystem on first boot.
+6. On Linux, with e2fsprogs installed, the ext4 filesystem is grown to that full partition while
+   the card is still open (`resize2fs` on a temp copy, written back through the same handle), so
+   root fills the card even when the GUI wrote it without root. A `meteor-expand-rootfs` marker
+   is also written on the boot partition; Meteor images grow on first boot if write-time resize
+   could not run (for example on macOS).
 7. The card is ejected.
 
 Raw disk access works the way the OS expects:
