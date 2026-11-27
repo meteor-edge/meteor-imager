@@ -22,14 +22,17 @@ for scripts and for flashing many cards.
 
 ## Download
 
-Get the build for your system from [Releases](https://github.com/meteor-edge/meteor-imager/releases):
+Latest stable build, direct links:
 
-| System | File | Notes |
+| System | Download | Notes |
 |---|---|---|
-| Windows | `MeteorImager-<version>-setup.exe` or `meteor-imager_<version>_windows_amd64.zip` | Asks for administrator rights when it starts (needed to write disks). |
-| macOS | `MeteorImager-<version>.dmg` (Apple silicon and Intel) | Not notarized yet: the first time, right-click the app → Open. |
-| Ubuntu / Debian | `meteor-imager_<version>_amd64.deb` / `arm64.deb` | `sudo apt install ./meteor-imager_*.deb` |
-| Other Linux | `MeteorImager-<version>-x86_64.AppImage` or the `.tar.gz` | `chmod +x` the AppImage and run it. |
+| Windows | [MeteorImager-setup.exe](https://github.com/meteor-edge/meteor-imager/releases/latest/download/MeteorImager-setup.exe) | Asks for administrator rights when it starts (needed to write disks). |
+| macOS | [MeteorImager.dmg](https://github.com/meteor-edge/meteor-imager/releases/latest/download/MeteorImager.dmg) (Apple silicon and Intel) | Not notarized yet: the first time, right-click the app → Open. |
+| Ubuntu / Debian | [amd64 .deb](https://github.com/meteor-edge/meteor-imager/releases/latest/download/meteor-imager_amd64.deb) / [arm64 .deb](https://github.com/meteor-edge/meteor-imager/releases/latest/download/meteor-imager_arm64.deb) | `sudo apt install ./meteor-imager_*.deb` |
+| Other Linux | [MeteorImager-x86_64.AppImage](https://github.com/meteor-edge/meteor-imager/releases/latest/download/MeteorImager-x86_64.AppImage) | `chmod +x` the AppImage and run it. |
+
+Portable `.zip` / `.tar.gz` builds, pre-releases and `SHA256SUMS` are on the
+[Releases](https://github.com/meteor-edge/meteor-imager/releases) page.
 
 ## Use the desktop UI
 

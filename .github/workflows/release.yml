@@ -1,22 +1,61 @@
 name: Release
 
+# Two ways to publish a release:
+#   1. Push a tag:      git tag v0.2.0 && git push origin v0.2.0
+#   2. Actions tab:     Release -> Run workflow -> version "v0.2.0" (pick the branch to build)
+#      The tag is created on the built commit when the release is published.
+# Versions with a "-" (v0.2.0-rc.3) are pre-releases. Everything else becomes
+# "Latest", so these links always point at the newest stable build:
+#   https://github.com/meteor-edge/meteor-imager/releases/latest
+#   https://github.com/meteor-edge/meteor-imager/releases/latest/download/MeteorImager-setup.exe
+
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.2.0 or v0.3.0-rc.1"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+
 jobs:
   binaries:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
     steps:
       - uses: actions/checkout@v5
+      - name: Check version
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Version must look like v1.2.3 or v1.2.3-rc.1, got '$VERSION'"
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" == workflow_dispatch ]] && gh release view "$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::Release $VERSION already exists"
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - run: go test ./...
-      - run: make cross VERSION=${{ github.ref_name }}
+      - run: make cross VERSION=$VERSION
       - uses: actions/upload-artifact@v4
         with:
           name: binaries
@@ -25,6 +64,7 @@ jobs:
   linux:
     needs: binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
@@ -41,8 +81,8 @@ jobs:
           APPIMAGETOOL: ${{ runner.temp }}/appimagetool
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
-          scripts/package-linux.sh ${{ github.ref_name }} amd64
-          scripts/package-linux.sh ${{ github.ref_name }} arm64
+          scripts/package-linux.sh "$VERSION" amd64
+          scripts/package-linux.sh "$VERSION" arm64
       - uses: actions/upload-artifact@v4
         with:
           name: linux
@@ -51,13 +91,15 @@ jobs:
   macos:
     needs: binaries
     runs-on: macos-latest
+    # macOS runners are sometimes slow to start; the build itself takes ~2 minutes.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
           name: binaries
           path: dist
-      - run: chmod +x dist/*/meteor-imager && scripts/package-macos.sh ${{ github.ref_name }}
+      - run: chmod +x dist/*/meteor-imager && scripts/package-macos.sh "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -66,6 +108,7 @@ jobs:
   windows:
     needs: binaries
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
@@ -75,7 +118,7 @@ jobs:
       - name: Portable zips
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart("v")
+          $v = $env:VERSION.TrimStart("v")
           New-Item -ItemType Directory -Force dist/release | Out-Null
           foreach ($arch in "amd64", "arm64") {
             Copy-Item LICENSE, README.md "dist/windows_$arch/"
@@ -84,7 +127,7 @@ jobs:
       - name: Installer
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart("v")
+          $v = $env:VERSION.TrimStart("v")
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
           $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
           if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
@@ -97,8 +140,9 @@ jobs:
           path: dist/release/*
 
   publish:
-    needs: [linux, macos, windows]
+    needs: [binaries, linux, macos, windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -107,6 +151,15 @@ jobs:
           path: release
           pattern: "{linux,macos,windows}"
           merge-multiple: true
+      - name: Version-free copies for /releases/latest/download links
+        run: |
+          v="${VERSION#v}"
+          cd release
+          cp "MeteorImager-${v}-setup.exe"          MeteorImager-setup.exe
+          cp "MeteorImager-${v}.dmg"                MeteorImager.dmg
+          cp "MeteorImager-${v}-x86_64.AppImage"    MeteorImager-x86_64.AppImage
+          cp "meteor-imager_${v}_amd64.deb"         meteor-imager_amd64.deb
+          cp "meteor-imager_${v}_arm64.deb"         meteor-imager_arm64.deb
       - name: Checksums
         run: cd release && sha256sum * > SHA256SUMS
       - name: Create release
@@ -114,7 +167,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Tags like v0.2.0-rc.1 are pre-releases: listed, but not "Latest".
-          pre=()
-          [[ "${{ github.ref_name }}" == *-* ]] && pre=(--prerelease)
-          gh release create "${{ github.ref_name }}" release/* "${pre[@]}" \
-            --repo "${{ github.repository }}" --title "Meteor Imager ${{ github.ref_name }}" --generate-notes
+          if [[ "$VERSION" == *-* ]]; then
+            flags=(--prerelease --latest=false)
+          else
+            flags=(--latest)
+          fi
+          # On a manual run the tag does not exist yet: create it on the commit we built.
+          gh release create "$VERSION" release/* "${flags[@]}" \
+            --target "${{ needs.binaries.outputs.sha }}" \
+            --repo "${{ github.repository }}" --title "Meteor Imager $VERSION" --generate-notes
